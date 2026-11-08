@@ -522,9 +522,29 @@ class ReadmeTests(Base):
         self.matches(r"기본(으로)?[^.\n]{0,30}읽지 않는다", sec)
 
     def test_C14_role_list_counts_the_new_fact(self):
-        head = self.text.split("## 역할", 1)[0]
-        self.has("5가지", head)
+        head = self.text.split("## 전체 구조", 1)[0]
+        self.has("6가지", head)
         self.has("맥락 이월", head)
+        self.has("전체 구조", head)
+
+    def test_structure_section_explains_the_whole_system(self):
+        sec = self.text.split("## 전체 구조", 1)[1].split("\n## ", 1)[0]
+        self.assertLess(self.text.index("## 전체 구조"), self.text.index("## 역할"))
+        for sub in ("### 한눈에 보기", "### 구성 요소", "### 실행하면 생기는 파일",
+                    "### 한 바퀴 흐름", "### 핸드오프 파일 안의 구조"):
+            self.has(sub, sec)
+        self.has("```mermaid", sec)
+        self.assertGreaterEqual(sec.count("```mermaid"), 2, "install and run diagrams")
+        for name in ("handoff_state.py", "check_handoff.py", "run_log.py", "install.py",
+                     "commands/handoff.md", "commands/resume-handoff.md"):
+            self.has(name, sec)
+        for path in ("~/.claude/handoffs/history/", "~/.claude/handoffs/.state/runs.jsonl",
+                     ".status.txt", "-session.tmp"):
+            self.has(path, sec)
+        for part in ("Goal (carried)", "Live subagents", "Live runners", "Live scheduled",
+                     "**Continues:**", "**Toplevel:**", "Closed (pointers)", "Exact Next Step",
+                     "continue: yes", "live subagent:"):
+            self.has(part, sec)
 
     def test_C14_no_em_dash_in_readme(self):
         self.lacks("\u2014")

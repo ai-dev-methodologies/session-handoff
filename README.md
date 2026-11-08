@@ -1,7 +1,8 @@
 # session-handoff
 
-`/handoff`와 `/resume-handoff` 명령 쌍의 정본 저장소다. 이 문서가 소유하는 사실은 다음 5가지다.
+`/handoff`와 `/resume-handoff` 명령 쌍의 정본 저장소다. 이 문서가 소유하는 사실은 다음 6가지다.
 
+- 전체 구조
 - 저장소의 역할
 - 설치 방법
 - 사용 방법
@@ -9,6 +10,129 @@
 - 규칙 파일의 경계(사용자 층과 프로젝트 층)
 
 핸드오프 파일의 양식과 단계별 절차는 `commands/handoff.md`와 `commands/resume-handoff.md`가 소유한다.
+
+## 전체 구조
+이 저장소가 하는 일은 한 세션이 알던 것을 다음 세션에 끊김 없이 넘기는 것이다. 넘길 때 지키는 것은 3가지다.
+
+- 최초 목표와 종결 조건을 그대로 넘긴다.
+- 돌고 있는 작업(서브에이전트·러너·예약 작업)을 끊지 않고 넘긴다.
+- 끝났고 이후 단계가 쓰지 않는 일은 넘기지 않고 이력 파일에 적어 둔다.
+
+### 한눈에 보기
+#### 설치
+```mermaid
+flowchart TD
+    subgraph REPO["이 저장소 (정본)"]
+        C["commands/<br/>handoff.md · resume-handoff.md"]
+        S["scripts/<br/>handoff_state.py · check_handoff.py · run_log.py"]
+        I["install.py"]
+    end
+    subgraph HOME["~/.claude (설치본)"]
+        IC["commands/"]
+        IS["scripts/"]
+    end
+    C --> I
+    S --> I
+    I -->|"복사 · 인터프리터 경로 바꿔 쓰기"| IC
+    I --> IS
+```
+
+#### 실행(세션 A에서 세션 B로)
+```mermaid
+flowchart TD
+    IC["~/.claude/commands/"]
+    IS["~/.claude/scripts/"]
+    UL["~/.claude/handoff-rules.local.md<br/>(사용자 층, 사용자가 직접 만든다)"]
+    PL["프로젝트 최상위/.claude/handoff-rules.local.md<br/>(프로젝트 층)"]
+    subgraph A["세션 A"]
+        H["/handoff"]
+    end
+    subgraph OUT["~/.claude/handoffs/"]
+        HF["핸드오프 파일<br/>YYYY-MM-DD-short-id-session.tmp"]
+        HI["history/ 이력 파일"]
+        ST[".state/ 상태 목록 파일 · runs.jsonl"]
+    end
+    subgraph B["세션 B"]
+        RH["/resume-handoff [--c]"]
+    end
+    NEXT["다음 작업"]
+    IC --> H
+    IS --> H
+    H --> HF
+    H --> HI
+    H --> ST
+    HF --> RH
+    IC --> RH
+    IS --> RH
+    RH -->|"브리핑 → 대기 또는 계속"| NEXT
+    UL -.-> H
+    PL -.-> H
+    UL -.-> RH
+    PL -.-> RH
+    ST -.-> RH
+    HI -.->|"열린 항목이 가리킬 때"| RH
+```
+
+실선은 설치·실행·쓰기·이어받기의 주 흐름이고, 점선은 필요할 때 읽는 참조다.
+
+### 구성 요소
+| 파일 | 하는 일 | 설치 위치 |
+|---|---|---|
+| `commands/handoff.md` | `/handoff` 명령 문서다. 핸드오프 파일의 양식과 쓰는 절차를 정한다 | `~/.claude/commands/` |
+| `commands/resume-handoff.md` | `/resume-handoff` 명령 문서다. 파일을 고르고 읽고 브리핑하는 절차를 정한다 | `~/.claude/commands/` |
+| `scripts/handoff_state.py` | 두 명령의 Step 0에서 한 번 실행한다. 공통 출력은 git 상태 요약·규칙 파일 경로·상태 목록 파일 경로다. `/handoff`는 이전 핸드오프·이력 파일 경로를 더 낸다. `--resume`은 고른 핸드오프·`continue:` 줄·서브에이전트 상태·검사 결과를 더 낸다 | `~/.claude/scripts/` |
+| `scripts/check_handoff.py` | 핸드오프 파일이 양식을 지켰는지 검사한다. `/handoff` Step 6과 `handoff_state.py`가 부른다 | `~/.claude/scripts/` |
+| `scripts/run_log.py` | 두 스크립트의 실행 결과를 `runs.jsonl`에 1줄씩 남긴다 | `~/.claude/scripts/` |
+| `install.py` | 위 5개 파일을 설치한다. 바뀌는 기존 파일은 먼저 백업한다. 저장소에만 있다 | 설치하지 않음 |
+| `tests/` | 위 파일의 동작을 고정하는 테스트다 | 설치하지 않음 |
+| `docs/field-map.md` | 옛 양식의 필드가 새 양식의 어디로 갔는지 대조한 기록이다 | 설치하지 않음 |
+
+### 실행하면 생기는 파일
+| 경로 | 쓰는 쪽 | 들어 있는 것 | 읽는 쪽 |
+|---|---|---|---|
+| `~/.claude/handoffs/YYYY-MM-DD-<short-id>-session.tmp` | `/handoff` | 핸드오프 본문 1개 | `/resume-handoff` · 이어 쓰는 다음 `/handoff` |
+| `~/.claude/handoffs/history/<프로젝트 폴더>-<해시>.md` | `/handoff`(덧붙이기만) | 끝났고 이후 단계가 쓰지 않는 항목 1줄씩 | 열린 항목이 가리킬 때만 `/resume-handoff` |
+| `~/.claude/handoffs/.state/<최상위 폴더>-<해시>.status.txt` | `handoff_state.py` | 바뀐 파일 전체 목록(상태 목록 파일) | 필요할 때 두 명령 |
+| `~/.claude/handoffs/.state/runs.jsonl` | 두 스크립트 | 실행마다 출력·종료 코드·고른 파일 경로(본문 제외) | 결과를 확인하는 사람 |
+
+상태 목록 파일의 해시는 최상위 폴더 경로에서 만든다. 이력 파일의 해시는 `project key:` 값에서 만들므로 연결 작업 트리끼리 같은 이력 파일을 쓴다.
+
+### 한 바퀴 흐름
+`/handoff`(세션 A)
+
+1. `handoff_state.py`를 한 번 실행해 상태를 받는다. git 요약은 1줄이고 파일 목록은 상태 목록 파일로 간다. 이전 핸드오프와 이력 파일 경로도 이때 받는다.
+2. 규칙 파일(사용자 층·프로젝트 층, 최대 2개)을 읽는다.
+3. 세션이 아는 것을 모은다. 이어받은 핸드오프가 있으면 `Goal (carried)`를 그대로 복사한다. 이전 핸드오프의 미해결 Live 항목은 이 핸드오프로 옮기거나 이력 파일로 닫는다.
+4. 끝났고 이후 단계가 쓰지 않는 항목은 이력 파일에 1줄씩 덧붙이고 본문에서 뺀다.
+5. 핸드오프 파일 1개를 쓴다.
+6. `check_handoff.py`로 검사하고, 경로와 `Resume: ready` 여부를 보고한다.
+
+`/resume-handoff`(세션 B)
+
+1. `handoff_state.py --resume`을 한 번 실행한다. 이 스크립트가 다음을 정한다.
+   - 인자가 없거나 날짜·slug이면 이 프로젝트의 핸드오프만 고른다(`**Toplevel:**` 기준).
+     - 경로를 직접 주면 그 파일을 쓴다. 다른 프로젝트의 파일이면 `continue: no (project mismatch)`를 낸다.
+   - 인자에 `--c`·`--continue`·`계속`이 있을 때만 `continue: yes`를 낸다.
+   - 서브에이전트마다 `live subagent: … -> returned / running? / lost / unknown`을 최대 5줄 낸다.
+2. 규칙 파일(0~2개)을 읽은 뒤 핸드오프 파일 전체를 읽는다.
+3. 돌고 있는 작업의 상태를 읽기 전용으로 확인한다.
+   - 서브에이전트: `ListAgents`와 `live subagent:` 줄로 정한다.
+   - 러너: 읽기 전용 에이전트 1개가 `done-when`을 보고 정한다.
+   - 예약 작업: 판정하지 않고 브리핑에 `fires-at`과 함께 싣는다.
+4. 브리핑한다. 머리 줄 다음 첫 항목은 최초 목표(`Goal (carried)`)다.
+5. `continue: yes`면 질문 없이 이어서 일한다. 그 밖에는 브리핑 뒤 기다린다.
+   - 이어서 일할 때 순서: `returned` 항목의 `after-return` → `lost` 항목 다시 맡기기 → `Exact Next Step`.
+
+### 핸드오프 파일 안의 구조
+| 부분 | 들어 있는 것 | 이어 쓸 때 |
+|---|---|---|
+| 머리 줄 | `**Project:**` · `**Toplevel:**`(프로젝트 판별용) · `**Continues:**` · `**Topic:**` | `Continues`에 이어받은 파일 경로. 처음이면 `none` |
+| `## Confidence` | `high` · `medium` · `low` | 매번 새로 정한다 |
+| `## Session State` | 브랜치 · HEAD · 바뀐 파일 · Live 3필드(`Live subagents`·`Live runners`·`Live scheduled`) | 미해결 Live 항목은 옮기거나 이력 파일로 닫는다 |
+| `## Goal (carried)` | `Origin` · `Goal` · `Done-when` · `Changes` | 그대로 복사한다. 사용자가 바꾸라고 했을 때만 고친다 |
+| 작업 기록 절 | 무엇을 만드는지 · 된 것 · 안 된 것 · 버린 가설 · 아직 안 해 본 것 · 파일 상태 · 결정(`What`·`Why`·`How` 표) · 막힌 것 | 끝났고 이후 단계가 쓰지 않는 것은 이력 파일로 옮긴다. 안 된 것과 버린 가설은 남긴다 |
+| `## Closed (pointers)` | 이력 파일 경로와 닫은 항목 키 | 닫은 항목이 있을 때만 |
+| `## Exact Next Step` | 다음 세션이 처음 할 일 | 매번 새로 쓴다 |
 
 ## 역할
 - `/handoff`는 세션이 아는 것을 날짜가 붙은 파일 하나로 `~/.claude/handoffs/`에 쓴다. 돌고 있는 작업은 멈추지 않는다.
