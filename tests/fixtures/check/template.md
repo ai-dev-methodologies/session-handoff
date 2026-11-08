@@ -49,6 +49,7 @@ Unpushed commits, Lockfile changed); the three Live fields stay required.]
 - **Origin:** [absolute path of the first handoff of the chain] · [YYYY-MM-DD]
 - **Goal:** [the original goal; on the first handoff, include the user's own words quoted]
 - **Done-when:** [the done condition; several conditions separated by `; `]
+- **Constraints:** [what was decided not to do, and what is out of scope; `none` when there is nothing; several separated by `; `]
 - **Changes:** [none | YYYY-MM-DD "[user's quote]" : [before → now]; several entries joined by `| `]
 
 ---

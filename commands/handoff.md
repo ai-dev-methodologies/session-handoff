@@ -86,8 +86,11 @@ Before writing, collect:
 - The goal chain. When this session started with `/resume-handoff`, take `Goal (carried)` from
   that handoff's section and copy it verbatim; Read that file again if it is no longer in context.
   Do not re-summarize it. Change `Goal` or `Done-when` only when the user said to change them, and
-  keep the user's quote. When the session did not start from a handoff, the user's own words in
-  this session become `Goal` (quote them) and `Done-when`
+  keep the user's quote. Copy `Constraints` verbatim too; new items may be added at the end, separated by `; `, and existing
+  items stay exactly as they are. Delete
+  or edit existing `Constraints` text only when the user said to, and then keep the quote and add
+  a `Changes` entry that contains `Constraints:`. When the session did not start from a handoff,
+  the user's own words in this session become `Goal` (quote them), `Done-when`, and `Constraints`
 - Whether the requirement changed during the session, and in what order
 - The unresolved `Live` items of the previous handoff (the file `**Continues:**` will name; Read it
   again if needed). Each one is copied into this handoff or closed into the history file (key = its
@@ -195,7 +198,7 @@ Put the handoff this session started from in the `**Continues:**` header line, r
 session did not start that way. The `previous handoff:` line from Step 0 is a candidate; confirm it
 against how this session actually started.
 
-Write `## Goal (carried)` before `## What We Are Building`, with its four keys:
+Write `## Goal (carried)` before `## What We Are Building`, with its five keys:
 
 - `Origin`: the absolute path of the first handoff of the chain, and its date. The first handoff of
   a chain writes its own absolute path, so every later copy stays byte-identical and still correct.
@@ -204,6 +207,11 @@ Write `## Goal (carried)` before `## What We Are Building`, with its four keys:
   the date, the user's quote, and `<before> → <now>` to `Changes`, and keep the earlier `Changes`
   entries and `Origin` as they are. Also record the same event in `Requirement Changes`, and have
   each of the two sections point at the other.
+- `Constraints`: what was decided not to do, and what is out of scope. Copy the previous file's
+  value verbatim; new items may be added at the end, separated by `; `, and existing items stay exactly as
+  they are. `none` means zero items. To delete or edit existing `Constraints` items, the
+  user must have said so in this session; keep the user's quote and add a `Changes` entry that
+  contains `Constraints:`, the date, and `<before> → <now>`.
 - `Changes`: `none` until the user changes the goal.
 
 When the previous file has no `Goal (carried)` (it was written in an older format), build the
@@ -250,14 +258,24 @@ State without its eight fields (the seven earlier ones and `**HEAD:**`; the five
 `n/a` outside git), a live item missing one of
 its six keys, a `name` without its `(<id>)`, or a `result` that is not an absolute path, a missing
 or placeholder-only `Exact Next Step`), and every break of the goal chain: a `Goal (carried)`
-without its four keys, a `Goal`, `Done-when`, or `Origin` that differs from the `**Continues:**`
-file without a matching `Changes` entry, a `**Continues:**` that is neither `none` nor an existing
-absolute path, a `Closed (pointers)` path that does not exist or lacks a listed key, and a Live
-item of the previous handoff that is neither carried nor closed
-(`Live item <name> from the previous handoff is missing`). Fix those
+without its five keys, a `Goal`, `Done-when`, or `Origin` that differs from the `**Continues:**`
+file without a matching `Changes` entry, a `Constraints` whose items do not start with all of the previous items unchanged
+(new items are added at the end, separated by `; `) and has no `Changes` entry that contains `Constraints:`, a `**Continues:**` that is
+neither `none` nor an existing absolute path, a `Closed (pointers)` path that does not exist or
+lacks a listed key, and a Live item of the previous handoff that is neither carried nor closed
+(`Live item <name> from the previous handoff is missing`). It also fails on a secret value in a
+provider-specific format: a token, or a private key block (from the `BEGIN … PRIVATE KEY` line to
+its `END` line, or a run of three or more long base64 lines). It prints the kind and the line or
+lines and never prints the value. The fix is to replace the token, or the whole key block, with
+`REDACTED` (no brackets); replacing only the header line still fails. These failures are printed
+before every other failure. The
+`Goal (carried)` comparison does not count that `REDACTED` replacement as a change. Fix those
 items and run it again; do not report until it exits 0. The checker also prints
-`WARNING: handoff file is <N> KiB (over 16 KiB)` for a large file; shorten the file as Step 5
-describes, and the exit code does not change.
+`WARNING: handoff file is <N> KiB (over 16 KiB)` for a large file, after the result block
+(`[PASS]` or `[FAIL]` and its list); the exit code does not change. Shorten the file as Step 5
+describes. Keep the never-trim list; a file that still exceeds the cap after that is left as it
+is. The checker's limit is fixed at 16 KiB. The project `values` size cap is used only for the
+Step 5 shortening order, and the checker never reads it.
 `/resume-handoff` runs the same checker on load, so a file that passes here is a file the next
 session can resume with one command.
 
@@ -295,7 +313,9 @@ rewrite the file with the correction.
 
 - Record environment variable names only, never their values.
 - Do not paste diffs into the file. Reference `path:L10-L45` and say what changed and why.
-- If an error message or command contains a credential, redact it and say that it was redacted.
+- If an error message or command contains a credential, redact it with `REDACTED` (no brackets) and
+  say that it was redacted. The Step 6 checker scans the file for provider-specific secret formats
+  mechanically and fails on a match.
 - The file lives in the home directory, never inside the repository.
 
 ---
@@ -354,6 +374,7 @@ Unpushed commits, Lockfile changed); the three Live fields stay required.]
 - **Origin:** [absolute path of the first handoff of the chain] · [YYYY-MM-DD]
 - **Goal:** [the original goal; on the first handoff, include the user's own words quoted]
 - **Done-when:** [the done condition; several conditions separated by `; `]
+- **Constraints:** [what was decided not to do, and what is out of scope; `none` when there is nothing; several separated by `; `]
 - **Changes:** [none | YYYY-MM-DD "[user's quote]" : [before → now]; several entries joined by `| `]
 
 ---

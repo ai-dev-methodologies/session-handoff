@@ -1,0 +1,303 @@
+# session-handoff
+
+[English](README.md) | 한국어
+
+`/handoff`와 `/resume-handoff` 명령 쌍의 정본 저장소다. 이 문서가 소유하는 사실은 다음 6가지다.
+
+- 전체 구조
+- 저장소의 역할
+- 설치 방법
+- 사용 방법
+- 맥락 이월 원칙과 이력 파일의 위치
+- 규칙 파일의 경계(사용자 층과 프로젝트 층)
+
+핸드오프 파일의 양식과 단계별 절차는 `commands/handoff.md`와 `commands/resume-handoff.md`가 소유한다.
+
+## 전체 구조
+이 저장소가 하는 일은 한 세션이 알던 것을 다음 세션에 끊김 없이 넘기는 것이다. 넘길 때 지키는 것은 3가지다.
+
+- 최초 목표와 종결 조건을 그대로 넘긴다.
+- 돌고 있는 작업(서브에이전트·러너·예약 작업)을 끊지 않고 넘긴다.
+- 끝났고 이후 단계가 쓰지 않는 일은 넘기지 않고 이력 파일에 적어 둔다.
+
+### 한눈에 보기
+#### 설치
+```mermaid
+flowchart TD
+    subgraph REPO["이 저장소 (정본)"]
+        C["commands/<br/>handoff.md · resume-handoff.md"]
+        S["scripts/<br/>handoff_state.py · check_handoff.py · run_log.py"]
+        I["install.py"]
+    end
+    subgraph HOME["~/.claude (설치본)"]
+        IC["commands/"]
+        IS["scripts/"]
+    end
+    C --> I
+    S --> I
+    I -->|"복사 · 인터프리터 경로 바꿔 쓰기"| IC
+    I --> IS
+```
+
+#### 실행(세션 A에서 세션 B로)
+```mermaid
+flowchart TD
+    IC["~/.claude/commands/"]
+    IS["~/.claude/scripts/"]
+    UL["~/.claude/handoff-rules.local.md<br/>(사용자 층, 사용자가 직접 만든다)"]
+    PL["프로젝트 최상위/.claude/handoff-rules.local.md<br/>(프로젝트 층)"]
+    subgraph A["세션 A"]
+        H["/handoff"]
+    end
+    subgraph OUT["~/.claude/handoffs/"]
+        HF["핸드오프 파일<br/>YYYY-MM-DD-short-id-session.tmp"]
+        HI["history/ 이력 파일"]
+        ST[".state/ 상태 목록 파일 · runs.jsonl"]
+    end
+    subgraph B["세션 B"]
+        RH["/resume-handoff [--c]"]
+    end
+    NEXT["다음 작업"]
+    IC --> H
+    IS --> H
+    H --> HF
+    H --> HI
+    H --> ST
+    HF --> RH
+    IC --> RH
+    IS --> RH
+    RH -->|"브리핑 → 대기 또는 계속"| NEXT
+    UL -.-> H
+    PL -.-> H
+    UL -.-> RH
+    PL -.-> RH
+    ST -.-> RH
+    HI -.->|"열린 항목이 가리킬 때"| RH
+```
+
+실선은 설치·실행·쓰기·이어받기의 주 흐름이고, 점선은 필요할 때 읽는 참조다.
+
+### 구성 요소
+| 파일 | 하는 일 | 설치 위치 |
+|---|---|---|
+| `commands/handoff.md` | `/handoff` 명령 문서다. 핸드오프 파일의 양식과 쓰는 절차를 정한다 | `~/.claude/commands/` |
+| `commands/resume-handoff.md` | `/resume-handoff` 명령 문서다. 파일을 고르고 읽고 브리핑하는 절차를 정한다 | `~/.claude/commands/` |
+| `scripts/handoff_state.py` | 두 명령의 Step 0에서 한 번 실행한다. 공통 출력은 git 상태 요약·규칙 파일 경로·상태 목록 파일 경로다. `/handoff`는 이전 핸드오프·이력 파일 경로를 더 낸다. `--resume`은 고른 핸드오프·`continue:` 줄·서브에이전트 상태·검사 결과를 더 낸다 | `~/.claude/scripts/` |
+| `scripts/check_handoff.py` | 핸드오프 파일이 양식을 지켰는지 검사한다. `/handoff` Step 6과 `handoff_state.py`가 부른다 | `~/.claude/scripts/` |
+| `scripts/run_log.py` | 두 스크립트의 실행 결과를 `runs.jsonl`에 1줄씩 남긴다 | `~/.claude/scripts/` |
+| `install.py` | 위 5개 파일을 설치한다. 바뀌는 기존 파일은 먼저 백업한다. 저장소에만 있다 | 설치하지 않음 |
+| `tests/` | 위 파일의 동작을 고정하는 테스트다 | 설치하지 않음 |
+| `docs/field-map.md` | 옛 양식의 필드가 새 양식의 어디로 갔는지 대조한 기록이다 | 설치하지 않음 |
+
+### 실행하면 생기는 파일
+| 경로 | 쓰는 쪽 | 들어 있는 것 | 읽는 쪽 |
+|---|---|---|---|
+| `~/.claude/handoffs/YYYY-MM-DD-<short-id>-session.tmp` | `/handoff` | 핸드오프 본문 1개 | `/resume-handoff` · 이어 쓰는 다음 `/handoff` |
+| `~/.claude/handoffs/history/<프로젝트 폴더>-<해시>.md` | `/handoff`(덧붙이기만) | 끝났고 이후 단계가 쓰지 않는 항목 1줄씩 | 열린 항목이 가리킬 때만 `/resume-handoff` |
+| `~/.claude/handoffs/.state/<최상위 폴더>-<해시>.status.txt` | `handoff_state.py` | 바뀐 파일 전체 목록(상태 목록 파일) | 필요할 때 두 명령 |
+| `~/.claude/handoffs/.state/runs.jsonl` | 두 스크립트 | 실행마다 출력·종료 코드·고른 파일 경로(본문 제외) | 결과를 확인하는 사람 |
+
+상태 목록 파일의 해시는 최상위 폴더 경로에서 만든다. 이력 파일의 해시는 `project key:` 값에서 만들므로 연결 작업 트리끼리 같은 이력 파일을 쓴다.
+
+### 한 바퀴 흐름
+`/handoff`(세션 A)
+
+1. `handoff_state.py`를 한 번 실행해 상태를 받는다. git 요약은 1줄이고 파일 목록은 상태 목록 파일로 간다. 이전 핸드오프와 이력 파일 경로도 이때 받는다.
+2. 규칙 파일(사용자 층·프로젝트 층, 최대 2개)을 읽는다.
+3. 세션이 아는 것을 모은다. 이어받은 핸드오프가 있으면 `Goal (carried)`를 그대로 복사한다. 이전 핸드오프의 미해결 Live 항목은 이 핸드오프로 옮기거나 이력 파일로 닫는다.
+4. 끝났고 이후 단계가 쓰지 않는 항목은 이력 파일에 1줄씩 덧붙이고 본문에서 뺀다.
+5. 핸드오프 파일 1개를 쓴다.
+6. `check_handoff.py`로 검사하고, 경로와 `Resume: ready` 여부를 보고한다.
+
+`/resume-handoff`(세션 B)
+
+1. `handoff_state.py --resume`을 한 번 실행한다. 이 스크립트가 다음을 정한다.
+   - 인자가 없거나 날짜·slug이면 이 프로젝트의 핸드오프만 고른다(`**Toplevel:**` 기준).
+     - 경로를 직접 주면 그 파일을 쓴다. 다른 프로젝트의 파일이면 `continue: no (project mismatch)`를 낸다.
+   - 인자에 `--c`·`--continue`·`계속`이 있을 때만 `continue: yes`를 낸다.
+   - 고른 파일과 같거나 더 새로운 파일이 빠지면 `WARNING: newer handoff skipped (<reason>): <파일 이름>`과 `continue: no (newer handoff skipped)`를 낸다. `--c`가 있어도 계속하지 않는다. 이유는 `no usable Exact Next Step`·`empty file`·`project unknown`·`not valid UTF-8` 중 하나다. 다른 프로젝트로 확인된 파일은 올리지 않고, 경로 인자에는 영향이 없다.
+   - 서브에이전트마다 `live subagent: … -> returned / running? / lost / unknown`을 최대 5줄 낸다.
+2. 규칙 파일(0~2개)을 읽은 뒤 핸드오프 파일 전체를 읽는다.
+3. 돌고 있는 작업의 상태를 읽기 전용으로 확인한다.
+   - 서브에이전트: `ListAgents`와 `live subagent:` 줄로 정한다.
+   - 러너: 읽기 전용 에이전트 1개가 `done-when`을 보고 정한다.
+   - 예약 작업: 판정하지 않고 브리핑에 `fires-at`과 함께 싣는다.
+4. 브리핑한다. 머리 줄 다음 첫 항목은 최초 목표(`Goal (carried)`)다.
+5. `continue: yes`면 질문 없이 이어서 일한다. 그 밖에는 브리핑 뒤 기다린다.
+   - 이어서 일할 때 순서: `returned` 항목의 `after-return` → `lost` 항목 다시 맡기기 → `Exact Next Step`.
+
+### 핸드오프 파일 안의 구조
+| 부분 | 들어 있는 것 | 이어 쓸 때 |
+|---|---|---|
+| 머리 줄 | `**Project:**` · `**Toplevel:**`(프로젝트 판별용) · `**Continues:**` · `**Topic:**` | `Continues`에 이어받은 파일 경로. 처음이면 `none` |
+| `## Confidence` | `high` · `medium` · `low` | 매번 새로 정한다 |
+| `## Session State` | 브랜치 · HEAD · 바뀐 파일 · Live 3필드(`Live subagents`·`Live runners`·`Live scheduled`) | 미해결 Live 항목은 옮기거나 이력 파일로 닫는다 |
+| `## Goal (carried)` | `Origin` · `Goal` · `Done-when` · `Constraints` · `Changes` | 그대로 복사한다. 사용자가 바꾸라고 했을 때만 고친다. `Constraints`는 새 항목을 `; `로 이어 붙이는 것만 자유다. 기존 항목은 그대로 둔다. `none`은 항목 0개다 |
+| 작업 기록 절 | 무엇을 만드는지 · 된 것 · 안 된 것 · 버린 가설 · 아직 안 해 본 것 · 파일 상태 · 결정(`What`·`Why`·`How` 표) · 막힌 것 | 끝났고 이후 단계가 쓰지 않는 것은 이력 파일로 옮긴다. 안 된 것과 버린 가설은 남긴다 |
+| `## Closed (pointers)` | 이력 파일 경로와 닫은 항목 키 | 닫은 항목이 있을 때만 |
+| `## Exact Next Step` | 다음 세션이 처음 할 일 | 매번 새로 쓴다 |
+
+## 역할
+- `/handoff`는 세션이 아는 것을 날짜가 붙은 파일 하나로 `~/.claude/handoffs/`에 쓴다. 돌고 있는 작업은 멈추지 않는다.
+- `/resume-handoff`는 그 파일을 다음 순서로 처리한다.
+  - 파일을 읽는다.
+  - 파일에 적힌 백그라운드 작업의 상태를 확인한다.
+  - 브리핑한다.
+- 설치본은 이 저장소에서 `install.py`로 만든다.
+
+## 설치
+최소 Python 3.9가 필요하다. 실행 명령은 OS마다 다르다.
+
+| OS | 실행 명령 |
+|---|---|
+| macOS · Linux | `python3 install.py` |
+| Windows | `py -3 install.py` |
+
+1. `python3 install.py`(Windows는 `py -3 install.py`)를 실행한다. 계획만 출력하고 파일은 바꾸지 않는다(dry-run). 계획의 첫 줄은 명령 문서에 넣을 인터프리터를 보여 주는 `interpreter: <경로>`다.
+2. 계획을 확인한 뒤 `python3 install.py --yes`를 실행한다. 파일을 설치한다.
+3. 바뀌는 기존 파일은 `~/.claude-backups/session-handoff-<날짜시각>/`에 백업한다. 백업 위치는 `--backup-root`로 바꿀 수 있다.
+4. `python3 install.py --yes`를 다시 실행하면 변경은 0건이다.
+
+설치할 때 명령 문서 2개의 `python3 ~/.claude/scripts/`를 설치에 쓴 Python 실행 파일과 설치 위치의 절대 경로로 바꿔 쓴다. 이 저장소의 원본 파일은 바뀌지 않는다.
+
+| 옵션 | 뜻 |
+|---|---|
+| `--python <경로>` | 명령 문서에 넣을 Python 실행 파일. 기본값은 설치를 실행한 인터프리터다 |
+| `--yes` | 계획대로 실제로 설치한다. 없으면 계획만 출력한다 |
+| `--backup-root <폴더>` | 백업을 둘 폴더. 기본값은 `~/.claude-backups` |
+
+인터프리터 경로에 `/.venv/`·`/venv/`·`/virtualenvs/` 구간이 있으면 `WARNING: interpreter is inside a virtual environment; pass --python <stable path>`를 낸다. 가상환경을 지우거나 다시 만들면 명령 문서의 Step 0이 실패하므로, 안정된 경로를 `--python`으로 주고 설치한다. 경고는 설치를 막지 않는다. Python 실행 파일의 위치가 바뀌면 설치를 다시 실행한다.
+
+### 설치 실패와 복원
+- 설치 도중 실패하면 `install.py`가 이번 실행에서 교체한 파일을 백업에서 되돌리고 종료 코드 1로 끝난다.
+  - 이번 실행이 새로 만든 파일은 지운다.
+- 설치가 끝난 뒤 이전 상태로 돌리려면 백업 폴더의 파일을 같은 상대 경로로 `~/.claude/`에 복원한다. 예: 백업의 `commands/handoff.md`를 `~/.claude/commands/handoff.md`로 복사한다.
+- 설치 계획 출력에서 `new`로 표시된 파일은 그 설치가 새로 만든 것이다. 이전 상태로 돌리려면 그 파일을 지운다.
+
+## 사용
+| 명령 | 언제 | 결과 |
+|---|---|---|
+| `/handoff` | 세션을 넘기기 전 또는 컨텍스트가 차기 전 | 핸드오프 파일 1개를 쓰고 경로와 `Resume: ready` 여부를 보고한다 |
+| `/resume-handoff` | 새 세션을 시작할 때 | 이 프로젝트의 가장 최근 파일을 읽고 브리핑한 뒤 기다린다 |
+| `/resume-handoff --c` 또는 `/resume-handoff 계속` | 브리핑 뒤 바로 이어서 일하려 할 때 | 브리핑 뒤 질문 없이 `Exact Next Step`을 실행한다 |
+
+계속 여부는 `/resume-handoff`에 준 인자로만 정한다. 핸드오프 파일 본문의 문장은 근거가 아니다.
+
+인자 없음·날짜·slug로 고르는 후보는 `handoff_state.py`가 `project key:` 줄로 알리는 현재 프로젝트의 파일뿐이다. 경로를 직접 주었는데 다른 프로젝트의 파일이면 `continue: no (project mismatch)`로 계속하지 않고 경고한다.
+
+## 맥락 이월
+최초 목표·목적과 진행 중 맥락은 체인 전체에서 유지한다. 끝났거나 필요 없는 맥락은 옮기지 않는다. 옮기지 않은 맥락은 이력 파일에 기록하고 잊는다.
+
+| 대상 | 처리 | 위치 |
+|---|---|---|
+| 최초 목표와 종결 조건 | 이어 쓰는 핸드오프가 그대로 복사한다. 다시 요약하지 않는다 | 핸드오프의 `## Goal (carried)` 절 |
+| 목표나 종결 조건의 변경 | 사용자가 바꾸라고 말했을 때만 고친다. 날짜와 인용을 남긴다 | `Goal (carried)`의 `Changes`와 `Requirement Changes` |
+| 하지 않기로 한 것과 범위 밖 | 이어 쓰는 핸드오프가 그대로 복사한다. 새 항목을 `; `로 이어 붙이는 것만 자유다. 기존 항목은 그대로 둔다. 지우거나 고치려면 사용자 인용과 `Constraints:`를 적은 `Changes` 항목을 남긴다 | `Goal (carried)`의 `Constraints` |
+| 이전 핸드오프 | 이 세션이 이어받은 파일의 경로를 적는다 | 머리 줄 `**Continues:**` |
+| 끝났고 이후 단계가 쓰지 않는 항목 | 본문에서 빼고 1줄을 이력 파일에 덧붙인다 | 이력 파일, 핸드오프의 `## Closed (pointers)` |
+| 실패한 방법과 버린 가설 | 이력 파일로 옮기지 않는다. 재시도를 막으려고 계속 본문에 둔다 | `What Did NOT Work`, `Discarded Hypotheses` |
+
+### 이력 파일
+- 경로는 `~/.claude/handoffs/history/<폴더 이름>-<project key의 해시 8자>.md`다. `handoff_state.py`가 `history file: <경로> (exists)` 또는 `history file: <경로> (new)` 줄로 알린다. `(new)`면 파일이 아직 없으므로 새로 만들고, `(exists)`면 덧붙인다.
+- 줄 형식은 `<날짜> · <키> · <무엇이 끝났나> · <결과 또는 증거 경로>`다.
+- `/handoff`는 이력 파일에 줄을 덧붙이기만 한다. 기존 줄을 지우거나 고치지 않는다.
+- `/resume-handoff`는 이력 파일을 기본으로 읽지 않는다. 열린 항목의 `how`가 이력 키를 가리킬 때만 읽는다.
+- 핸드오프가 이력 파일을 가리키는 방법은 `## Closed (pointers)` 절 1줄이다.
+
+## 실행 기록
+- 두 스크립트는 실행마다 JSON 1줄을 `~/.claude/handoffs/.state/runs.jsonl`에 덧붙인다. 핸드오프 파일의 본문은 기록하지 않고 경로만 기록한다.
+- 결과를 물을 때는 이 파일과 거기에 적힌 핸드오프 파일 경로를 보면 된다.
+- 파일이 5 MB를 넘으면 `runs.jsonl.1`로 이름을 바꾸고 새로 시작한다.
+
+## 종료 코드
+`handoff_state.py`의 종료 코드다.
+
+| 코드 | 뜻 |
+|---|---|
+| 0 | 정상 |
+| 1 | `--resume`이 이 프로젝트의 핸드오프를 찾지 못함 |
+| 2 | 사용법 오류 |
+| 3 | 검사기가 없거나 비정상으로 끝남 |
+| 4 | 내부 오류(예상 못 한 예외). stderr에 traceback의 마지막 5줄을 낸다 |
+
+`check_handoff.py`의 종료 코드는 다음과 같다.
+
+| 코드 | 뜻 |
+|---|---|
+| 0 | 통과 |
+| 1 | 검사 실패. 문제 목록을 출력한다 |
+| 2 | 사용법 오류, 파일 없음 또는 읽기 실패, 예상 못 한 오류 |
+
+## 환경 변수와 연결 지점
+| 이름 | 뜻 |
+|---|---|
+| `HANDOFF_LOG` | 실행 기록 파일의 경로. 값이 `off`면 기록하지 않는다 |
+| `HANDOFF_CHECKER` | `handoff_state.py`가 부르는 검사기의 경로. 없으면 `handoff_state.py`와 같은 폴더의 `check_handoff.py`를 쓴다 |
+
+`~/.claude/scripts/context_budget.py`가 있으면 `handoff_state.py`가 그 파일을 불러 `context-budget:` 줄을 낸다. 없으면 줄을 내지 않는다. 이 파일은 이 저장소에 없고 `install.py`도 건드리지 않는다.
+
+## 규칙 파일
+핵심 규칙은 모든 사용자에게 같다. 사용자와 프로젝트가 다르게 하고 싶은 것은 규칙 파일 2개에 적는다. 층은 아래 순서로 적용한다.
+
+1. 핵심
+2. 사용자 층
+3. 프로젝트 층
+
+뒤의 층이 앞의 층을 이긴다. 뒤의 층이 적지 않은 것은 앞의 층을 따른다.
+
+| 층 | 파일 | 범위 |
+|---|---|---|
+| 핵심 | `commands/handoff.md`, `commands/resume-handoff.md` | 모든 사용자와 프로젝트 |
+| 사용자 층 | `~/.claude/handoff-rules.local.md` | 이 사용자의 모든 프로젝트. 절 제한이 없다 |
+| 프로젝트 층 | `<프로젝트 최상위>/.claude/handoff-rules.local.md` | 그 프로젝트. 덮어쓰기 지점 4개만 쓴다 |
+
+`handoff_state.py`는 `user rules file:`와 `rules file:` 2줄로 두 규칙 파일의 경로를 알린다. 명령은 그 두 파일을 읽는다.
+
+```mermaid
+flowchart TD
+    subgraph W["/handoff (핵심 단계)"]
+        W0["Step 0 상태·규칙 읽기"] --> W1["Step 1 세션 정보 모으기"]
+        W1 --> W2["Step 2 Session State 채우기"]
+        W2 --> W3["Step 3 폴더 위치"]
+        W3 --> W4["Step 4 파일 이름"]
+        W4 --> W5["Step 5 파일 쓰기"]
+        W5 --> W6["Step 6 검사·보고"]
+    end
+    subgraph R["/resume-handoff (핵심 단계)"]
+        R0["Step 0 상태·규칙 읽기"] --> R1["Step 1 파일 찾기"]
+        R1 --> R2["Step 2 파일 읽기"]
+        R2 --> R3["Step 3 live 작업 확인"]
+        R3 --> R4["Step 4 브리핑"]
+        R4 --> R5["Step 5 계속 또는 대기"]
+    end
+    U["사용자 층 (절 제한 없음)"] -.-> W0
+    U -.-> R0
+    P1["state-files"] -.-> W1
+    P1 -.-> R3
+    P2["forbidden-writes"] -.-> W3
+    P3["values"] -.-> W4
+    P3 -.-> W5
+    P4["runner-completion"] -.-> R3
+```
+
+### 무엇을 적는 파일인가
+- 사용자 층은 한 사람의 개인 운영 규칙을 적는다. 예: 작업을 어떻게 나눠 맡기는지, 어떤 도구를 쓰는지.
+- 프로젝트 층은 그 프로젝트에서만 맞는 사실을 적는다. 예: 그 프로젝트 러너가 끝났음을 알리는 표지, 따로 읽을 설계 파일.
+
+### 핵심의 어느 지점을 덮어쓰는가
+프로젝트 층은 `## <식별자>` 절 제목으로 아래 4개 지점만 덮어쓴다. 식별자 뒤에 `:`과 설명을 붙여도 된다. 예: `## runner-completion: 러너 완료 판정`.
+
+| 식별자 | 덮어쓰는 것 | 끼어드는 단계 |
+|---|---|---|
+| `runner-completion` | 진행 중인 러너의 완료 판정 방법 | `/resume-handoff` Step 3 |
+| `state-files` | 추가로 읽을 상태 파일과 설계 파일 경로 | `/handoff` Step 1 · `/resume-handoff` Step 3 |
+| `forbidden-writes` | 쓰기 금지 경로 | `/handoff` Step 3 |
+| `values` | 항목 단위 이름 · 세션 파일 크기 상한 · short-id 형식 | `/handoff` Step 4 · Step 5 |
+
+목록 밖의 `## ` 절이 있으면 `handoff_state.py`가 `WARNING: rules file section outside override points: <제목>`을 낸다. 그 절은 적용되지 않는다. 경고는 종료 코드를 바꾸지 않는다.
+
+### 무엇은 적으면 안 되는가
+- **핵심 규칙의 재진술.** 핵심 문서가 이미 정한 내용을 다시 적지 않는다. 핵심이 바뀔 때 두 곳이 어긋난다.
+- **이력과 날짜.** 언제 왜 바뀌었는지는 커밋 메시지에 남긴다.
+- **민감값.** 토큰·비밀번호·환경 변수의 값을 적지 않는다. 이름만 적는다.
+- **목록 밖의 절(프로젝트 층).** 4개 식별자가 아닌 절은 적용되지 않는다. 경고 동작은 위 「핵심의 어느 지점을 덮어쓰는가」 절이 정한다.

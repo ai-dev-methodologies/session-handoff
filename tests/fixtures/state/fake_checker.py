@@ -18,6 +18,16 @@ if mode == "crash1":  # an uncaught exception also exits 1, with no [FAIL] line
 if mode == "argv":
     print("[PASS] argv=" + " ".join(sys.argv[1:]))
     sys.exit(0)
+if mode == "sizewarn":  # the size warning, unindented like the real checker prints it
+    print("[PASS] all checks passed")
+    print("WARNING: handoff file is 20 KiB (over 16 KiB)")
+    sys.exit(0)
+if mode == "sizewarn_cap":  # warning plus exactly CHECK_CAP result lines
+    print("WARNING: handoff file is 20 KiB (over 16 KiB)")
+    print("[FAIL] 8 finding(s):")
+    for i in range(7):
+        print(f"  - finding {i}")
+    sys.exit(1)
 if mode == "exit2":
     err.write("fake checker crashed\n".encode("utf-8"))
     sys.exit(2)

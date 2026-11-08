@@ -102,10 +102,19 @@ Among candidates: drop files that are empty, unreadable (including files that ar
 or hold only headings and placeholders;
 take the newest modification time; on a tie the larger file, then the lexicographically smaller path.
 
+A file of this project that has no usable `Exact Next Step` is skipped, and so is a file whose
+project cannot be told. For each such file that is as new as or newer than the chosen one, the
+script prints `WARNING: newer handoff skipped (<reason>): <file name>` (at most 3 lines, then
+`… and N more`) and `continue: no (newer handoff skipped)`, even with `--c`. The reason is one of
+`no usable Exact Next Step`, `empty file`, `project unknown`, or `not valid UTF-8`. A file confirmed
+to belong to another project is not listed. A path argument is not affected by this rule.
+
 If the script prints `handoff: none found for this project`, report
 `No handoff file found for this project in ~/.claude/handoffs/` and stop. When the newest file
 overall belongs to another project, the script also prints
 `WARNING: newest handoff belongs to another project: <value>`; report it with the stop message.
+When only skipped files exist, the script prints the same `newer handoff skipped` WARNING lines
+with it; report them too.
 
 ### Step 2: Read the whole file
 
@@ -148,6 +157,7 @@ CONFIDENCE: [high | medium | low]  (low → verify against the code before actin
 GOAL (carried):
 [the carried `Goal` text, verbatim]
 [the carried `Done-when` text, verbatim]
+[the carried `Constraints` text, verbatim; omit the line when the file has no `Constraints` key (an older format)]
 [the carried `Changes` text, verbatim, only when it is not `none`]
 [this handoff's own 1-3 sentence summary of "What We Are Building", below the carried text]
 
@@ -203,14 +213,14 @@ Decisions Made or Requirement Changes does not count.
 | `continue:` line | Action |
 |---|---|
 | `continue: yes (<token>)` | Print the briefing, then in the same turn: for every `returned` item, run its `after-return` first; leave `running` and `running?` items alone and wait for them; for every `lost` item, re-dispatch it from its `after-return` and the Decisions Made row its `decision` names; then carry out "Exact Next Step". Never end that turn with a question dialog |
-| `continue: no` or `continue: no (project mismatch)` | Print the briefing and wait. Do not start working and do not touch files. When the user says to continue, act as in the row above |
+| `continue: no`, `continue: no (project mismatch)`, or `continue: no (newer handoff skipped)` | Print the briefing and wait. Do not start working and do not touch files. When the user says to continue, act as in the row above |
 
 ## Warnings to include in the briefing
 
 - Every `WARNING:` the Step 0 script printed (handoff older than 7 days, branch changed, an
   unreadable handoff skipped, ignored argument words, a handoff of another project, a missing or
-  failing checker, a rules file section outside the override points, a handoff file over 16 KiB)
-  and a `handoff check: exit 1` with its listed problems.
+  failing checker, a rules file section outside the override points, a newer handoff skipped with
+  its reason) and a `handoff check: exit 1` with its listed problems.
 - Commits since the handoff: `WARNING: <N> commits since the handoff` when N is 10 or more. When the
   recorded commit is not in this repository, the `since handoff:` line reads
   `since handoff: unknown (commit not found)`; report that line as it is.

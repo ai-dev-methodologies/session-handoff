@@ -1,4 +1,5 @@
-"""Specifies the new check_handoff.py behavior (spec sections 2, 5, 6, 7, 8, 9, 10, 14.1-14.5).
+"""Specifies the new check_handoff.py behavior (spec sections 2, 5, 6, 7, 8, 9, 10, 14.1-14.5, 17.2-17.4,
+18.1, 18.2, 18.4, 18.5).
 
 Test names carry the review-verdict item id (M1, A3, ...). A negative test asserts the exit code and a
 needle the message must carry (an item name, a field label, a section title), so a handoff that already
@@ -53,13 +54,14 @@ def without_section(text, title):
 
 
 ORIGIN = "/home/u/.claude/handoffs/2026-11-08-retry-session.tmp · 2026-11-08"  # same as both fixtures
+CONSTRAINTS = "edit src/sync.py only; keep the queue schema unchanged"  # same as both fixtures
 
 
 def goal_section(origin=ORIGIN,
                  goal='Make the sync job survive timeouts without dropping events. User: "retry the sync job instead of dropping events"',
                  done="a 30s outage loses no events; `python -m unittest tests.test_sync` passes",
-                 changes="none", omit=()):
-    values = {"Origin": origin, "Goal": goal, "Done-when": done, "Changes": changes}
+                 constraints=CONSTRAINTS, changes="none", omit=()):
+    values = {"Origin": origin, "Goal": goal, "Done-when": done, "Constraints": constraints, "Changes": changes}
     return "\n".join(f"- **{k}:** {v}".rstrip() for k, v in values.items() if k not in omit)
 
 
@@ -731,12 +733,13 @@ class GoalCarriedTest(CheckerCase):
         self.assertFailsWith(self.run_text(without_section(self.base, "Goal (carried)")), "Goal (carried)")
 
     def test_C1_missing_key_fails_with_its_name(self):
-        for key in ("Origin", "Goal", "Done-when", "Changes"):
+        for key in ("Origin", "Goal", "Done-when", "Constraints", "Changes"):
             with self.subTest(key=key):
                 self.assertFailsWith(self.run_text(self.with_goal(omit=(key,))), "Goal (carried)", key)
 
     def test_C1_placeholder_value_fails_with_key_name(self):
-        for key, kw in (("Origin", "origin"), ("Goal", "goal"), ("Done-when", "done"), ("Changes", "changes")):
+        for key, kw in (("Origin", "origin"), ("Goal", "goal"), ("Done-when", "done"),
+                        ("Constraints", "constraints"), ("Changes", "changes")):
             for value in ("", "TBD", "[fill in]", "<x>"):
                 with self.subTest(key=key, value=value):
                     self.assertFailsWith(self.run_text(self.with_goal(**{kw: value})), "Goal (carried)", key)
@@ -922,6 +925,14 @@ class SizeWarningTest(CheckerCase):
 
     def test_C5_small_valid_fixture_does_not_warn(self):
         self.assertNotIn("WARNING", self.run_text(self.base).stdout)
+
+    def test_F2_warning_comes_after_the_result_block(self):
+        for base, mark in ((self.base, "[PASS]"), (self.base.replace("**Continues:** none\n", ""), "[FAIL]")):
+            with self.subTest(result=mark):
+                out = self.run_text(self.sized(self.LIMIT + 10, base)).stdout.splitlines()
+                self.assertTrue(out[0].startswith(mark), out)
+                self.assertTrue(self.WARNING.match(out[-1]), out)
+                self.assertEqual(len([ln for ln in out if ln.startswith("WARNING")]), 1, out)
 
     def test_C5_warning_does_not_hide_a_failure(self):
         text = self.sized(self.LIMIT + 10, self.base.replace("**Continues:** none\n", ""))
@@ -1127,6 +1138,328 @@ class ClosedKeyExactTest(CheckerCase):
     def test_L9_whole_key_passes(self):
         path = self.history(keys=("a", "key-b"))
         self.assertPasses(self.run_text(self.with_closed(f"- 2 items closed → {path} (keys: a, key-b)")))
+
+
+# --- 17.2: secret-like values ---------------------------------------------------------------------
+# Tokens are assembled at run time: no file of this public repository holds a complete token.
+SECRETS = (
+    ("GitHub token", "gh" + "p_" + "a" * 36),
+    ("GitHub token", "gh" + "s_" + "B1" * 18),
+    ("GitHub fine-grained token", "github" + "_pat_" + "C" * 22),
+    ("sk- API key", "sk" + "-" + "dE4" * 7),
+    ("Slack token", "xo" + "xb-" + "1" * 10),
+    ("AWS access key", "AK" + "IA" + "Q" * 16),
+    ("Google API key", "AI" + "za" + "e" * 35),
+)
+TOKEN = SECRETS[0][1]
+
+
+class SecretTest(CheckerCase):
+    def with_note(self, line):
+        """The valid fixture with `line` as the body of Environment & Setup Notes, and that line's number."""
+        text = set_section(self.base, "Environment & Setup Notes", line, sep=False)
+        return text, text.split("\n").index(line) + 1
+
+    def test_F1_each_kind_fails_with_kind_and_line_but_no_value(self):
+        for kind, token in SECRETS:
+            with self.subTest(kind=kind):
+                text, n = self.with_note(f"Set the variable to {token} before the run.")
+                proc = self.run_text(text)
+                self.assertFailsWith(proc, f"secret-like value ({kind}) on line {n}; replace it with REDACTED")
+                self.assertNotIn(token, proc.stdout + proc.stderr)
+                self.assertNotIn(token, (self.tmp / "runs.jsonl").read_text(encoding="utf-8"))
+
+    def test_F1_value_echoed_by_another_failure_is_not_printed(self):
+        text = self.base.replace("**Toplevel:** /home/u/sample-project", f"**Toplevel:** {TOKEN}")
+        proc = self.run_text(text)
+        self.assertFailsWith(proc, "Toplevel", "secret-like value (GitHub token) on line 6")
+        self.assertNotIn(TOKEN, proc.stdout + proc.stderr)
+
+    def test_F1_value_cut_by_a_truncated_message_is_not_printed(self):
+        item = "- " + "x" * 95 + " " + TOKEN + " with no labels at all"
+        text = set_section(self.base, "What Has NOT Been Tried Yet", item)
+        proc = self.run_text(text)
+        self.assertFailsWith(proc, "what/why/how", "secret-like value (GitHub token)")
+        self.assertNotIn(TOKEN[:12], proc.stdout + proc.stderr)
+
+    def test_F1_value_in_the_previous_file_is_not_printed(self):
+        prev = self.tmp / "previous.md"
+        prev_text = PREVIOUS.read_text(encoding="utf-8").replace("/home/u/sample-project", f"/home/u/{TOKEN}")
+        prev.write_text(prev_text, encoding="utf-8", newline="\n")
+        proc = self.run_text(self.base.replace("**Continues:** none", f"**Continues:** {prev}"))
+        self.assertFailsWith(proc, "another **Toplevel:**")
+        self.assertNotIn(TOKEN[:12], proc.stdout + proc.stderr)
+
+    def test_F1_line_with_EXAMPLE_is_skipped(self):
+        for line in (f"The docs show {'AK' + 'IA' + 'IOSFODNN7' + 'EXAMPLE'} as a key.",
+                     f"EXAMPLE only: {TOKEN}"):
+            with self.subTest(line=line[:20]):
+                self.assertPasses(self.run_text(self.with_note(line)[0]))
+
+    def test_F1_prose_about_tokens_passes(self):
+        line = "Send the bearer token in the header; the password stays in the vault; sk-short; ghp_ is a prefix."
+        self.assertPasses(self.run_text(self.with_note(line)[0]))
+
+    def test_F1_kebab_word_ending_in_sk_is_not_a_key(self):
+        slugs = ("task", "retry", "the", "sync", "job", "with", "backoff"), ("disk", "usage", "report", "for", "the", "hosts")
+        line = "See " + " and ".join("-".join(s) for s in slugs) + "."  # assembled: a plain sk- grep would flag it
+        self.assertPasses(self.run_text(self.with_note(line)[0]))
+
+    def test_F1_redacted_marker_passes(self):
+        self.assertPasses(self.run_text(self.with_note("Set the variable to REDACTED before the run.")[0]))
+
+    def test_F1_each_kind_in_a_printed_item_is_not_printed(self):
+        # The item lacks what/why/how, so its excerpt is printed: only redaction keeps the value out.
+        for kind, token in SECRETS:
+            with self.subTest(kind=kind):
+                text = set_section(self.base, "What Has NOT Been Tried Yet", f"- Try {token} on the mirror before the release run")
+                proc = self.run_text(text)
+                self.assertFailsWith(proc, "what/why/how", f"secret-like value ({kind})")
+                self.assertIn("REDACTED on the mirror", proc.stdout)
+                self.assertNotIn(token, proc.stdout + proc.stderr)
+                self.assertNotIn(token, (self.tmp / "runs.jsonl").read_text(encoding="utf-8"))
+
+    def test_M1_sk_kebab_names_in_paths_and_branches_pass(self):
+        name = "s" + "k-telecom-billing-gateway"  # assembled: a plain sk- grep would flag it
+        text = self.base.replace("**Toplevel:** /home/u/sample-project", f"**Toplevel:** /home/u/dev/{name}")
+        self.assertPasses(self.run_text(text))
+        text = set_section(self.base, "Session State", state_section(branch="feature/s" + "k-telecom-billing-integration"))
+        self.assertPasses(self.run_text(text))
+
+    def test_M1_sk_tail_needs_both_a_digit_and_an_upper_case_letter(self):
+        cases = (("sk-" + "abc1" * 6, False), ("sk-" + "abcD" * 6, False), ("sk-" + "ab" + "c1D" * 6, True))
+        for token, secret in cases:
+            with self.subTest(token=token[:6], secret=secret):
+                proc = self.run_text(self.with_note(f"Set the variable to {token} before the run.")[0])
+                if secret:
+                    self.assertFailsWith(proc, "secret-like value (sk- API key)")
+                else:
+                    self.assertPasses(proc)
+
+    def test_L7_secret_block_comes_before_every_other_failure_block(self):
+        text = set_section(self.base, "What Has NOT Been Tried Yet", f"- Try {TOKEN} on the mirror before the release run")
+        text = text.replace("**Toplevel:** /home/u/sample-project", "**Toplevel:** sample-project")
+        text = set_section(text, "Decisions Made", "We chose X.")
+        proc = self.run_text(text)
+        self.assertFailsWith(proc, "secret-like value (GitHub token)")
+        heads = [ln for ln in proc.stdout.splitlines() if ln.startswith("[FAIL]")]
+        self.assertEqual(len(heads), 4, proc.stdout)
+        self.assertIn("secret-like value(s):", heads[0])
+
+
+# --- 18.1: private key blocks -------------------------------------------------------------------------
+# The header is assembled and the body is base64-looking filler: no file here holds a key.
+KEY_BEGIN = "-----BEGIN " + "OPENSSH PRIVATE" + " KEY-----"
+KEY_END = "-----END " + "OPENSSH PRIVATE" + " KEY-----"
+
+
+def key_body(lines=4, width=70):
+    return [(f"Qm{i}x" + "Zk9+" * 20)[:width] for i in range(lines)]
+
+
+class PrivateKeyTest(CheckerCase):
+    def with_note(self, body_lines):
+        """The valid fixture with `body_lines` as Environment & Setup Notes, and the first line's number."""
+        text = set_section(self.base, "Environment & Setup Notes", "\n".join(body_lines), sep=False)
+        return text, text.split("\n").index(body_lines[0]) + 1
+
+    def message(self, a, b):
+        return f"secret-like value (private key block) on lines {a}-{b}; replace the whole block with REDACTED"
+
+    def assertNoKey(self, proc):
+        out = proc.stdout + proc.stderr + (self.tmp / "runs.jsonl").read_text(encoding="utf-8")
+        for line in key_body():
+            self.assertNotIn(line[:12], out)
+
+    def test_H1_whole_block_fails_with_its_line_range(self):
+        block = ["Deploy key:", KEY_BEGIN] + key_body() + [KEY_END, "Rotate it after the run."]
+        text, n = self.with_note(block)
+        proc = self.run_text(text)
+        self.assertFailsWith(proc, self.message(n + 1, n + 6))
+        self.assertEqual(proc.stdout.count("secret-like value ("), 1, proc.stdout)
+        self.assertNoKey(proc)
+
+    def test_H1_block_without_end_runs_to_the_end_of_the_file(self):
+        text, n = self.with_note([KEY_BEGIN] + key_body())
+        last = len(text.rstrip("\n").split("\n"))
+        proc = self.run_text(text)
+        self.assertFailsWith(proc, self.message(n, last))
+        self.assertNoKey(proc)
+
+    def test_H1_masking_only_the_header_still_fails(self):
+        text, n = self.with_note(["REDACTED"] + key_body(2) + [KEY_END])
+        proc = self.run_text(text)
+        self.assertFailsWith(proc, self.message(n + 1, n + 3))
+        self.assertNotIn("no secret-like values", proc.stdout)
+
+    def test_H1_body_left_without_begin_or_end_fails(self):
+        text, n = self.with_note(["REDACTED"] + key_body(3) + ["Rotate it after the run."])
+        self.assertFailsWith(self.run_text(text), self.message(n + 1, n + 3))
+
+    def test_H1_body_rule_needs_three_lines_of_64_characters(self):
+        for lines, width, secret in ((2, 70, False), (3, 63, False), (3, 64, True)):
+            with self.subTest(lines=lines, width=width):
+                proc = self.run_text(self.with_note(["Notes:"] + key_body(lines, width))[0])
+                if secret:
+                    self.assertFailsWith(proc, "secret-like value (private key block)")
+                else:
+                    self.assertPasses(proc)
+
+    def test_H1_key_inside_an_item_is_not_printed(self):
+        item = "\n".join(["- Try the deploy key for the mirror:", "  " + KEY_BEGIN]
+                         + ["  " + ln for ln in key_body()] + ["  " + KEY_END])
+        text = set_section(self.base, "What Has NOT Been Tried Yet", item)
+        proc = self.run_text(text)
+        self.assertFailsWith(proc, "what/why/how", "secret-like value (private key block)")
+        self.assertIn("Try the deploy key for the mirror: REDACTED", proc.stdout)
+        self.assertNoKey(proc)
+
+    def test_H1_block_replaced_with_redacted_passes(self):
+        proc = self.run_text(self.with_note(["Deploy key:", "REDACTED"])[0])
+        self.assertPasses(proc)
+        self.assertIn("no secret-like values", proc.stdout)
+
+
+class SecretChainTest(CheckerCase):
+    """F1: a token copied into Goal (carried) can be masked with REDACTED without breaking the chain."""
+    chain = GoalChainTest.chain
+
+    def setUp(self):
+        super().setUp()
+        self.prev_text = PREVIOUS.read_text(encoding="utf-8")
+        self.prev = self.tmp / "previous.md"
+
+    def goal(self, secret):
+        return f'Make the sync job survive timeouts. User: "use the key {secret} for the mirror"'
+
+    def test_F1_masking_a_carried_token_is_not_a_change(self):
+        proc = self.chain(goal_kw=dict(goal=self.goal("REDACTED")), prev_kw=dict(goal=self.goal(TOKEN)))
+        self.assertPasses(proc)
+
+    def test_F1_masking_a_carried_token_in_constraints_is_not_a_change(self):
+        prev = dict(constraints=f"never push with {TOKEN}")
+        self.assertPasses(self.chain(goal_kw=dict(constraints="never push with REDACTED"), prev_kw=prev))
+
+    def test_F1_carried_token_kept_fails_as_a_secret_not_as_a_change(self):
+        proc = self.chain(goal_kw=dict(goal=self.goal(TOKEN)), prev_kw=dict(goal=self.goal(TOKEN)))
+        self.assertFailsWith(proc, "secret-like value (GitHub token)")
+        self.assertNotIn("changed without a Changes entry", proc.stdout)
+        self.assertNotIn(TOKEN, proc.stdout)
+
+    def test_F1_masking_does_not_excuse_another_change(self):
+        cur = dict(goal=self.goal("REDACTED") + " and the queue")
+        proc = self.chain(goal_kw=cur, prev_kw=dict(goal=self.goal(TOKEN)))
+        self.assertFailsWith(proc, "Goal (carried) changed without a Changes entry")
+        self.assertNotIn(TOKEN, proc.stdout)
+
+    def test_L6_goal_comparison_masks_both_sides_itself(self):
+        # Called directly, so neither side was masked upstream (main and read_lines mask in the real run).
+        mod = load_checker()
+        raw_read = lambda path: path.read_text(encoding="utf-8").split("\n")
+        for cur_secret, prev_secret, patch in ((TOKEN, "REDACTED", False), ("REDACTED", TOKEN, True)):
+            with self.subTest(current=cur_secret[:3], previous=prev_secret[:3]):
+                self.prev.write_text(set_section(self.prev_text, "Goal (carried)", goal_section(goal=self.goal(prev_secret))),
+                                     encoding="utf-8", newline="\n")
+                cur = self.base.replace("**Continues:** none", f"**Continues:** {self.prev}")
+                cur = set_section(cur, "Goal (carried)", goal_section(goal=self.goal(cur_secret)))
+                if patch:
+                    mod.read_lines = raw_read
+                self.assertEqual(mod.goal_failures(cur.split("\n")), [])
+
+
+class CrashSecretTest(CheckerCase):
+    def test_L6_traceback_tail_is_masked(self):
+        path = self.tmp / "h.md"
+        path.write_text(self.base, encoding="utf-8", newline="\n")
+        code = (
+            "import importlib.util, sys\n"
+            f"spec = importlib.util.spec_from_file_location('c', {str(CHECKER)!r})\n"
+            "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+            "def boom(lines): raise RuntimeError('bad value ' + sys.argv[1])\n"
+            "mod.decisions_failures = boom\n"
+            f"sys.exit(mod.run([{str(path)!r}]))\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", code, TOKEN], capture_output=True, text=True,
+                              encoding="utf-8", env=self.env())
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("RuntimeError: bad value REDACTED", proc.stderr)
+        self.assertNotIn(TOKEN, proc.stderr)
+
+
+# --- 17.4: Constraints in Goal (carried) --------------------------------------------------------------
+class ConstraintsTest(CheckerCase):
+    chain = GoalChainTest.chain
+
+    def setUp(self):
+        super().setUp()
+        self.prev_text = PREVIOUS.read_text(encoding="utf-8")
+        self.prev = self.tmp / "previous.md"
+
+    def four_keys(self, text):
+        return "\n".join(ln for ln in text.split("\n") if not ln.startswith("- **Constraints:**"))
+
+    def test_C1_fixtures_carry_constraints_between_done_when_and_changes(self):
+        keys = [m.group(1) for m in re.finditer(r"^- \*\*(.+?):\*\*", goal_section(), re.M)]
+        self.assertEqual(keys, ["Origin", "Goal", "Done-when", "Constraints", "Changes"])
+        self.assertIn(goal_section(), self.base)
+
+    def test_C1_missing_constraints_fails(self):
+        self.assertFailsWith(self.run_text(self.four_keys(self.base)), "Goal (carried) lacks Constraints")
+
+    def test_C1_constraints_none_passes(self):
+        self.assertPasses(self.run_text(set_section(self.base, "Goal (carried)", goal_section(constraints="none"))))
+
+    def test_C1_four_key_previous_still_compares_goal(self):
+        prev_text = self.four_keys(self.prev_text)
+        self.assertPasses(self.chain(prev_text=prev_text))
+        proc = self.chain(goal_kw=dict(goal="A drifted goal"), prev_text=prev_text)
+        self.assertFailsWith(proc, "Goal (carried) changed without a Changes entry")
+
+    def test_C1_constraint_appended_passes(self):
+        self.assertPasses(self.chain(goal_kw=dict(constraints=f"{CONSTRAINTS}; keep events in order")))
+
+    def test_C1_constraint_added_after_none_passes(self):
+        self.assertPasses(self.chain(goal_kw=dict(constraints="keep events in order"), prev_kw=dict(constraints="none")))
+
+    def test_C1_constraint_removed_or_rewritten_without_changes_entry_fails(self):
+        for value in ("edit src/sync.py only", "none", "edit src/sync.py and src/queue.py; keep the queue schema unchanged",
+                      f"keep events in order; {CONSTRAINTS}"):
+            with self.subTest(constraints=value):
+                self.assertFailsWith(self.chain(goal_kw=dict(constraints=value)), "Goal (carried)", "Constraints")
+
+    def test_C1_constraint_removed_with_a_changes_entry_naming_constraints_passes(self):
+        change = '2026-11-09 "the queue schema may change now" : Constraints: keep the queue schema unchanged → removed'
+        self.assertPasses(self.chain(goal_kw=dict(constraints="edit src/sync.py only", changes=change)))
+
+    def test_C1_quoted_goal_change_does_not_drop_constraints(self):
+        kw = dict(goal="Sync job and queue. User: \"also cover the queue\"", changes=CHANGE_1, constraints="none")
+        self.assertFailsWith(self.chain(goal_kw=kw), "Goal (carried)", "Constraints")
+
+    def test_M3_a_new_entry_after_one_entry_passes(self):
+        prev = dict(constraints="edit src/sync.py only")
+        self.assertPasses(self.chain(goal_kw=dict(constraints="edit src/sync.py only; keep events in order"), prev_kw=prev))
+
+    def test_M3_text_glued_onto_the_last_entry_fails(self):
+        # String prefix would pass all of these; the rule compares whole `; ` entries.
+        cases = ((CONSTRAINTS, f"{CONSTRAINTS} and the table"),
+                 ("edit src/sync.py only", "edit src/sync.py only, and keep events in order"),
+                 ("edit src/sync.py only", "edit src/sync.py only (until Friday)"))
+        for before, after in cases:
+            with self.subTest(after=after[-24:]):
+                proc = self.chain(goal_kw=dict(constraints=after), prev_kw=dict(constraints=before))
+                self.assertFailsWith(proc, "Goal (carried) Constraints dropped or rewrote an entry")
+
+    def test_L3_none_words_are_no_entries(self):
+        for word in ("없음", "None", "NONE", "none"):
+            with self.subTest(previous=word):
+                proc = self.chain(goal_kw=dict(constraints="keep events in order"), prev_kw=dict(constraints=word))
+                self.assertPasses(proc)
+
+    def test_L6_an_older_changes_entry_naming_constraints_does_not_excuse_a_new_drop(self):
+        old = '2026-11-08 "the schema rule stays" : Constraints: edit src/sync.py only → kept'
+        proc = self.chain(goal_kw=dict(constraints="edit src/sync.py only", changes=old),
+                          prev_kw=dict(changes=old))
+        self.assertFailsWith(proc, "Goal (carried) Constraints dropped or rewrote an entry")
 
 
 # --- L-3: the template fixture is the current command template ----------------------------------------

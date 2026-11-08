@@ -18,10 +18,14 @@ Resume contract (what /resume-handoff needs without running anything but handoff
   - The head carries `**Toplevel:** <absolute path>` (the project key handoff_state.py printed) and
     `**Continues:** none | <absolute path of an existing previous handoff>`: not this file itself, and
     of the same Toplevel when both files carry one.
-  - "Goal (carried)" carries Origin, Goal, Done-when and Changes with real values; Origin starts with an
-    absolute path. When Continues names a file that has the same section, Origin is byte-identical to
-    it, its Changes entries are the first entries here unchanged, and Goal and Done-when are
-    byte-identical unless Changes gained an entry; a new entry carries a quoted user sentence.
+  - "Goal (carried)" carries Origin, Goal, Done-when, Constraints and Changes with real values (Constraints
+    may be none); Origin starts with an absolute path. When Continues names a file that has the same
+    section, only the keys that file carries are compared: Origin is byte-identical to it, its Changes
+    entries are the first entries here unchanged, Goal and Done-when are byte-identical unless Changes
+    gained an entry, and its Constraints entries (split at `; `; none or 없음 is no entry) are the first
+    entries here, whole and unchanged, unless a new Changes entry names `Constraints:`; a new entry
+    carries a quoted user sentence. Both sides are compared with secret-like values replaced by
+    REDACTED, so masking a carried token is not a change.
   - Every live item of the Continues file (key: the id in its name, else the whole name) appears in one
     of the live fields here, or among the keys of "Closed (pointers)".
   - "Closed (pointers)", when present, is `- <N> items closed -> <history file> (keys: a, b)`: the file is
@@ -37,7 +41,16 @@ Resume contract (what /resume-handoff needs without running anything but handoff
     section is not checked.
   - "Exact Next Step" exists and is neither empty, only placeholder lines, nor one [...] or <...> block.
 
-A file over SIZE_LIMIT_KIB prints one `WARNING: handoff file is <N> KiB (over 16 KiB)` line; the exit code is unchanged.
+Secret-like values: a line holding a provider token form of SECRET_PATTERNS fails as
+`secret-like value (<kind>) on line <N>; replace it with REDACTED`, unless the line holds EXAMPLE. A
+private key is a block: from its BEGIN line to its END line (or the end of the file), an END line with
+the base64 lines just above it, or KEY_BODY_MIN_LINES base64 lines of KEY_BODY_MIN_CHARS or more in a
+row; it fails as `secret-like value (private key block) on lines <A>-<B>; replace the whole block with
+REDACTED`. These failures print first. No printed line carries the value: every other check reads this
+file and the Continues file with those forms and every line of a key block replaced by REDACTED.
+
+A file over SIZE_LIMIT_KIB prints one `WARNING: handoff file is <N> KiB (over 16 KiB)` line after the result
+block; the exit code is unchanged.
 Every run appends one record to the run log (run_log.py next to this file).
 
 Exit 0 = every check passes. Exit 1 = at least one check failed (listed). Exit 2 = usage error, file missing
@@ -71,13 +84,32 @@ SEPARATOR_RE = re.compile(r"^\|?[\s:|-]*-[\s:|-]*\|?$")
 TOPLEVEL_RE = re.compile(r"^\*\*Toplevel:\*\*\s*(.*)$")
 CONTINUES_RE = re.compile(r"^\*\*Continues:\*\*\s*(.*)$")
 GOAL_SECTION = "Goal (carried)"
-GOAL_KEYS = ("Origin", "Goal", "Done-when", "Changes")
+GOAL_KEYS = ("Origin", "Goal", "Done-when", "Constraints", "Changes")
 GOAL_SAME_KEYS = ("Origin", "Goal", "Done-when")  # carried verbatim unless Changes gained an entry
+CONSTRAINT_SPLIT_RE = re.compile(r"\s*;\s+")
+CONSTRAINTS_CHANGE = "Constraints:"  # a new Changes entry naming this may drop or rewrite a constraint
 CHANGE_SPLIT_RE = re.compile(r"\s*\|\s+")
 QUOTE_RE = re.compile(r"\"[^\"]+\"|“[^”]+”|「[^」]+」")
 CLOSED_SECTION = "Closed (pointers)"
 CLOSED_RE = re.compile(r"^\s*[-*]\s+.*?(?:→|->)\s*(.+?)\s*\(keys:\s*(.*?)\)\s*$")
 SIZE_LIMIT_KIB = 16
+SECRET_PATTERNS = (  # provider token forms only; the left guard keeps `task-…` and `disk-…` slugs out
+    ("GitHub token", re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,}")),
+    ("GitHub fine-grained token", re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{22,}")),
+    # a real key tail mixes digits and upper case; a kebab name (`sk-telecom-billing-…`) has neither
+    ("sk- API key", re.compile(r"(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Z])[A-Za-z0-9_-]{20,}")),
+    ("Slack token", re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("AWS access key", re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}")),
+    ("Google API key", re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}")),
+)
+SECRET_SKIP_WORD = "EXAMPLE"  # documented sample keys (AWS docs) carry it; it never exempts a private key block
+KEY_KIND = "private key block"  # the value of a private key is its body, so the whole block is the secret
+KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+KEY_END_RE = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+KEY_BODY_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+KEY_BODY_MIN_CHARS = 64
+KEY_BODY_MIN_LINES = 3  # a body left behind without its BEGIN and END lines
+REDACTED = "REDACTED"  # no brackets: a bracketed value would read as a placeholder
 NAME_ID_RE = re.compile(r"\(([^()]*)\)\s*$")
 ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 NOT_IDS = ("running", "done", "pending", "none", "tbd", "todo")
@@ -95,6 +127,70 @@ def is_placeholder(text: str) -> bool:
     if s.lower() in PLACEHOLDER_WORDS:
         return True
     return (s[0], s[-1]) in (("[", "]"), ("<", ">"))
+
+
+def is_key_body(line: str) -> bool:
+    s = line.strip()
+    return len(s) >= KEY_BODY_MIN_CHARS and bool(KEY_BODY_RE.match(s))
+
+
+def key_blocks(lines: "list[str]") -> "list[tuple[int, int]]":
+    """(first, last) 0-based line indexes of every private key block, in file order."""
+    blocks, i = [], 0
+    while i < len(lines):
+        if KEY_BEGIN_RE.search(lines[i]):
+            end = next((j for j in range(i, len(lines)) if KEY_END_RE.search(lines[j])), None)
+            if end is None:  # no END line: the block runs to the last non-empty line of the file
+                end = len(lines) - 1
+                while end > i and not lines[end].strip():
+                    end -= 1
+            blocks.append((i, end))
+            i = end + 1
+            continue
+        j = i
+        while j < len(lines) and is_key_body(lines[j]):
+            j += 1
+        if j < len(lines) and KEY_END_RE.search(lines[j]):  # an END line and the body lines just above it
+            blocks.append((i, j))
+            i = j + 1
+        elif j - i >= KEY_BODY_MIN_LINES:
+            blocks.append((i, j - 1))
+            i = j
+        else:
+            i = max(j, i + 1)
+    return blocks
+
+
+def redact_key_line(line: str) -> str:
+    """A line of a key block as REDACTED, keeping its indentation, the text before BEGIN and after END."""
+    begin, end = KEY_BEGIN_RE.search(line), KEY_END_RE.search(line)
+    head = line[:begin.start()] if begin else line[:len(line) - len(line.lstrip())]
+    return head + REDACTED + (line[end.end():] if end else "")
+
+
+def redact(text: str) -> str:
+    """`text` with every secret-like value, and every line of a private key block, replaced by REDACTED."""
+    lines = text.split("\n")
+    for first, last in key_blocks(lines):
+        for i in range(first, last + 1):
+            lines[i] = redact_key_line(lines[i])
+    text = "\n".join(lines)
+    for _, pattern in SECRET_PATTERNS:
+        text = pattern.sub(REDACTED, text)
+    return text
+
+
+def secret_failures(lines: "list[str]") -> "list[str]":
+    """One message per private key block, and per line and kind of token outside a block; a token line
+    holding EXAMPLE is skipped. In line order. No value is kept."""
+    blocks = key_blocks(lines)
+    inside = {i for first, last in blocks for i in range(first, last + 1)}
+    found = [(first, f"secret-like value ({KEY_KIND}) on lines {first + 1}-{last + 1}; "
+                     f"replace the whole block with {REDACTED}") for first, last in blocks]
+    found += [(n, f"secret-like value ({kind}) on line {n + 1}; replace it with {REDACTED}")
+              for n, line in enumerate(lines) if n not in inside and SECRET_SKIP_WORD not in line
+              for kind, pattern in SECRET_PATTERNS if pattern.search(line)]
+    return [msg for _, msg in sorted(found, key=lambda f: f[0])]
 
 
 def is_absolute_path(text: str) -> bool:
@@ -307,9 +403,9 @@ def continues_failures(lines: "list[str]", self_path: "Path | None" = None) -> "
 
 
 def read_lines(path: Path) -> "list[str] | None":
-    """Lines of a file, or None when it cannot be read as UTF-8."""
+    """Lines of a file with secret-like values as REDACTED, or None when it cannot be read as UTF-8."""
     try:
-        return path.read_text(encoding="utf-8").split("\n")
+        return redact(path.read_text(encoding="utf-8")).split("\n")
     except (OSError, UnicodeDecodeError):
         return None
 
@@ -323,6 +419,13 @@ def goal_fields(lines: "list[str]") -> "dict[str, str] | None":
             for k, (inline, rest) in session_fields(body).items()}
 
 
+def constraint_entries(value: str) -> "list[str]":
+    """Entries of a `Constraints` value: `none` or `없음` is no entry; `; ` separates several."""
+    if value.strip().lower() in NONE_WORDS:
+        return []
+    return [e for e in CONSTRAINT_SPLIT_RE.split(value.strip()) if e.strip()]
+
+
 def change_entries(value: str) -> "list[str]":
     """Entries of a `Changes` value: `none` is no entry; `| ` joins several."""
     if value.strip().lower() == "none":
@@ -331,10 +434,10 @@ def change_entries(value: str) -> "list[str]":
 
 
 def goal_failures(lines: "list[str]") -> "list[str]":
-    """Goal (carried): four real values, and no silent drift from the previous handoff of the chain."""
+    """Goal (carried): five real values, and no silent drift from the previous handoff of the chain."""
     goal = goal_fields(lines)
     if goal is None:
-        return [f"{GOAL_SECTION} section is missing (Origin, Goal, Done-when, Changes)"]
+        return [f"{GOAL_SECTION} section is missing ({', '.join(GOAL_KEYS)})"]
     problems = []
     for key in GOAL_KEYS:
         if key not in goal:
@@ -348,19 +451,29 @@ def goal_failures(lines: "list[str]") -> "list[str]":
     prev_path = continues_path(lines)
     prev_lines = read_lines(prev_path) if prev_path else None
     prev = goal_fields(prev_lines) if prev_lines else None
-    if prev is None or not all(k in prev for k in GOAL_KEYS):
+    if prev is None:
         return []
-    before, now = change_entries(prev["Changes"]), change_entries(goal["Changes"])
+    # Only the keys the previous file carries are compared (an older file has no Constraints), and a
+    # secret-like value masked as REDACTED on either side is not a change.
+    goal = {k: redact(v) for k, v in goal.items()}
+    prev = {k: redact(v) for k, v in prev.items() if k in GOAL_KEYS}
+    before, now = change_entries(prev.get("Changes", "none")), change_entries(goal["Changes"])
     if len(now) < len(before):
         return [f"{GOAL_SECTION} Changes lost {len(before) - len(now)} entr(ies) of the previous handoff; entries are never removed"]
     if now[:len(before)] != before:
         problems.append(f"{GOAL_SECTION} Changes rewrote an entry of {prev_path.name}; earlier entries are copied unchanged, new ones appended")
-    if len(now) > len(before):
-        if goal["Origin"] != prev["Origin"]:
+    added = now[len(before):]
+    if "Constraints" in prev:
+        kept = constraint_entries(prev["Constraints"])
+        if constraint_entries(goal["Constraints"])[:len(kept)] != kept and not any(CONSTRAINTS_CHANGE in e for e in added):
+            problems.append(f"{GOAL_SECTION} Constraints dropped or rewrote an entry of {prev_path.name}; append new ones "
+                            f"after it, or name {CONSTRAINTS_CHANGE} in a new Changes entry")
+    if added:
+        if "Origin" in prev and goal["Origin"] != prev["Origin"]:
             problems.append(f"{GOAL_SECTION} Origin differs from {prev_path.name}; Origin is copied unchanged")
-        unquoted = [e[:60] for e in now[len(before):] if not QUOTE_RE.search(e)]
+        unquoted = [e[:60] for e in added if not QUOTE_RE.search(e)]
         return problems + [f"{GOAL_SECTION} Changes entry has no quoted user sentence: {e}" for e in unquoted]
-    changed = [k for k in GOAL_SAME_KEYS if goal[k] != prev[k]]
+    changed = [k for k in GOAL_SAME_KEYS if k in prev and goal[k] != prev[k]]
     if changed:
         problems.append(f"{GOAL_SECTION} changed without a Changes entry ({', '.join(changed)} differ from {prev_path.name})")
     return problems
@@ -537,10 +650,8 @@ def main(argv: "list[str]") -> int:
     except (OSError, UnicodeDecodeError) as exc:
         print(f"cannot read {path}: {exc}")
         return 2
-    lines = text.split("\n")
-    size = len(text.encode("utf-8"))
-    if size > SIZE_LIMIT_KIB * 1024:
-        print(f"WARNING: handoff file is {-(-size // 1024)} KiB (over {SIZE_LIMIT_KIB} KiB)")
+    secrets = secret_failures(text.split("\n"))
+    lines = redact(text).split("\n")  # no message below can print a value, whole or cut
     failures = []
     for title in SECTIONS:
         try:
@@ -556,6 +667,10 @@ def main(argv: "list[str]") -> int:
                 failures.append((title, flat[:120]))
     decisions = decisions_failures(lines)
     contract = resume_contract_failures(lines, git, path)
+    if secrets:  # first: the resume excerpt keeps only the first lines of this output
+        print(f"[FAIL] {len(secrets)} secret-like value(s):")
+        for msg in secrets:
+            print(f"  - {msg}")
     if failures:
         print(f"[FAIL] {len(failures)} item(s) lack what/why/how or a design-file path:")
         for title, head in failures:
@@ -568,10 +683,14 @@ def main(argv: "list[str]") -> int:
         print(f"[FAIL] {len(contract)} resume-contract problem(s):")
         for msg in contract:
             print(f"  - {msg}")
-    if failures or decisions or contract:
-        return 1
-    print("[PASS] open items carry what/why/how or a design path; Decisions table and resume contract satisfied")
-    return 0
+    code = 1 if failures or decisions or contract or secrets else 0
+    if not code:
+        print("[PASS] open items carry what/why/how or a design path; Decisions table and resume contract satisfied; "
+              "no secret-like values")
+    size = len(text.encode("utf-8"))
+    if size > SIZE_LIMIT_KIB * 1024:
+        print(f"WARNING: handoff file is {-(-size // 1024)} KiB (over {SIZE_LIMIT_KIB} KiB)")
+    return code
 
 
 class _Tee:
@@ -614,7 +733,7 @@ def run(argv: "list[str]") -> int:
         code = main(argv)
     except Exception:
         tail = traceback.format_exc().rstrip("\n").splitlines()[-5:]
-        sys.stderr.write("\n".join(tail) + "\n")
+        sys.stderr.write(redact("\n".join(tail)) + "\n")
         code = 2
     finally:
         sys.stdout = tee.stream

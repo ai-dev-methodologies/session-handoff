@@ -53,6 +53,16 @@ reading only its last 256 KiB: a final stop_reason end_turn, stop_sequence, max_
 (an ISO time) has passed or it has been still for over 60 minutes, else `running? (idle)`. No copy is
 `lost (no transcript)`; an id outside [A-Za-z0-9_.:-] is `unknown (id not usable)`. At most 5 lines.
 
+In resume mode, a file as new as or newer than the chosen one (or, when none is chosen, any file) that
+is empty, names no project (Toplevel and Project both missing or placeholders), is not valid UTF-8
+while its head (read with errors="replace") names this project or none, or is this project's but has
+no usable Exact Next Step is named on a `WARNING: newer handoff skipped (<reason>): <file name>` line
+(reason `empty file` · `project unknown` · `not valid UTF-8` · `no usable Exact Next Step`), and
+`continue:` becomes `no (newer handoff skipped)` even with `--c`. An undecodable file keeps its
+`WARNING: unreadable handoff skipped:` line too. A path argument and files confirmed to belong to
+another project are not affected. The checker's `WARNING: handoff file is … KiB` line is left out of
+the resume excerpt (a resume cannot shrink the file); the checker's own run record keeps it.
+
 Each kind of WARNING line is capped at 3 lines; the third then says how many more there were.
 Every run appends one record to the run log (run_log.py next to this file).
 
@@ -115,6 +125,8 @@ DETACHED_RE = re.compile(r"^detached\s+([0-9a-f]{7,40})\b")
 HEAD_FIELD_RE = re.compile(r"^\*\*([^*]+):\*\*\s*(.*)$")
 OUTSIDE_WARNING = "WARNING: rules file section outside override points:"
 UNREADABLE_WARNING = "WARNING: unreadable handoff skipped:"
+SKIPPED_WARNING = "WARNING: newer handoff skipped"
+SIZE_WARNING = "WARNING: handoff file is "
 RUN: dict = {}  # facts for the run log, filled while the script runs
 
 
@@ -203,7 +215,7 @@ def write_status_file(top: Path, entries: list[tuple[str, str, str | None]]) -> 
 
 def chain_lines() -> None:
     """`previous handoff:` and `history file:` for the project key (default mode)."""
-    previous, warns, _ = resolve_handoff(None, RUN["project"])
+    previous, warns, _, _ = resolve_handoff(None, RUN["project"])
     for warn in warns:
         print(warn)
     print(f"previous handoff: {previous if previous else 'none'}")
@@ -401,41 +413,66 @@ def has_next_step(text: str) -> bool:
     return any(ln.strip() == "## Exact Next Step" for ln in lines)
 
 
-def resolve_handoff(selector: str | None, project: str) -> tuple[Path | None, list[str], str | None]:
+def resolve_handoff(selector: str | None, project: str) -> tuple[Path | None, list[str], str | None, list[str]]:
     """Implements /resume-handoff Step 1.
 
-    Returns (handoff path or None, warnings, project of the newest other-project file when none matched).
+    Returns (handoff path or None, warnings, project of the newest other-project file when none matched,
+    warnings for files that may be this project's, could not be used, and are as new as or newer than
+    the chosen one).
     """
     if selector:
         direct = Path(selector).expanduser()
         if direct.is_file():
-            return direct, [], None
+            return direct, [], None, []
         if "/" in selector or "\\" in selector or selector.endswith(".tmp"):
-            return None, [], None
+            return None, [], None, []
         if DATE_RE.match(selector):
             pattern = f"{selector}-*-session.tmp"
         else:
             pattern = f"????-??-??-{selector}*-session.tmp"
     else:
         pattern = "*-session.tmp"
-    found, unreadable = [], []
+    key = path_key(project)
+    found, skipped, unreadable = [], [], []
     for p in HANDOFF_DIR.glob(pattern):
         if not p.is_file():
             continue
         try:
             text = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except UnicodeDecodeError:  # often a write cut inside a multibyte character: the head survives
+            unreadable.append(f"{UNREADABLE_WARNING} {p.name}")
+            try:
+                owner_key = handoff_project(p.read_text(encoding="utf-8", errors="replace"))[0]
+            except OSError:
+                owner_key = None
+            if owner_key in (key, None):
+                skipped.append((p, "not valid UTF-8"))
+            continue
+        except OSError:
             unreadable.append(f"{UNREADABLE_WARNING} {p.name}")
             continue
-        if has_next_step(text):
-            found.append((p, handoff_project(text)))
+        if not text:
+            skipped.append((p, "empty file"))
+            continue
+        owner, usable = handoff_project(text), has_next_step(text)
+        if usable:
+            found.append((p, owner))
+        if owner[0] is None:
+            skipped.append((p, "project unknown"))
+        elif owner[0] == key and not usable:
+            skipped.append((p, "no usable Exact Next Step"))
     warns = capped(sorted(unreadable), UNREADABLE_WARNING)
     found.sort(key=lambda f: (-f[0].stat().st_mtime, -f[0].stat().st_size, str(f[0])))
-    key = path_key(project)
     mine = [p for p, (k, _) in found if k == key]
-    if mine:
-        return mine[0], warns, None
-    return None, warns, (found[0][1][1] or "unknown") if found else None
+    chosen = mine[0] if mine else None
+    floor = chosen.stat().st_mtime if chosen else float("-inf")
+    newer = sorted(((p, why) for p, why in skipped if p.stat().st_mtime >= floor),
+                   key=lambda s: (-s[0].stat().st_mtime, s[0].name))
+    rest = ", ".join(dict.fromkeys(why for _, why in newer[WARN_CAP - 1:]))  # reasons behind "… and N more"
+    skip_warns = capped([f"{SKIPPED_WARNING} ({why}): {p.name}" for p, why in newer], f"{SKIPPED_WARNING} ({rest}):")
+    if chosen:
+        return chosen, warns, None, skip_warns
+    return None, warns, (found[0][1][1] or "unknown") if found else None, skip_warns
 
 
 def recorded_field(path: Path, label: str) -> str | None:
@@ -569,6 +606,7 @@ def run_checker(path: Path, in_git: bool) -> int:
     )
     RUN["checker"] = proc.returncode
     out = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    out = [ln for ln in out if not ln.lstrip().startswith(SIZE_WARNING)]  # a resume cannot shrink the file
     crashed_1 = proc.returncode == 1 and not any(ln.startswith("[FAIL]") for ln in out)
     if proc.returncode not in (0, 1) or crashed_1:
         why = " without a [FAIL] line" if crashed_1 else ""
@@ -587,17 +625,22 @@ def run_checker(path: Path, in_git: bool) -> int:
 def resume_block(args: list[str], branch: str | None, in_git: bool) -> int:
     token, selector, ignored = parse_args(args)
     explicit = bool(selector) and Path(selector).expanduser().is_file()
-    path, warns, other = resolve_handoff(selector, RUN["project"])
+    path, warns, other, skipped = resolve_handoff(selector, RUN["project"])
     mismatch = None
     if path is not None and explicit:  # a path argument is not filtered, only compared
         key, shown = handoff_project(path.read_text(encoding="utf-8", errors="replace"))
         if key != path_key(RUN["project"]):
             mismatch = shown or "unknown"
-    RUN["continue"] = "no (project mismatch)" if mismatch else (f"yes ({token})" if token else "no")
+    if mismatch:
+        RUN["continue"] = "no (project mismatch)"
+    elif skipped:
+        RUN["continue"] = "no (newer handoff skipped)"
+    else:
+        RUN["continue"] = f"yes ({token})" if token else "no"
     print(f"continue: {RUN['continue']}")
     if ignored:
         print(f"WARNING: ignored argument words: {' '.join(ignored)}")
-    for warn in warns:
+    for warn in warns + skipped:
         print(warn)
     if path is None:
         print("handoff: none found for this project" + (f" matching {selector!r}" if selector else ""))

@@ -45,6 +45,7 @@ high
 - **Origin:** /home/u/.claude/handoffs/2026-11-08-retry-session.tmp · 2026-11-08
 - **Goal:** Make the sync job survive timeouts without dropping events. User: "retry the sync job instead of dropping events"
 - **Done-when:** a 30s outage loses no events; `python -m unittest tests.test_sync` passes
+- **Constraints:** edit src/sync.py only; keep the queue schema unchanged
 - **Changes:** none
 
 ---

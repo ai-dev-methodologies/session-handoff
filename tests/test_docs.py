@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parent.parent
 HANDOFF = ROOT / "commands" / "handoff.md"
 RESUME = ROOT / "commands" / "resume-handoff.md"
 README = ROOT / "README.md"
+README_KO = ROOT / "README.ko.md"
 FIELD_MAP = ROOT / "docs" / "field-map.md"
 
 # Only used when git cannot list the files; with git, the ignore rules decide.
@@ -35,6 +36,14 @@ FORBIDDEN = [
     ("email", re.compile(r"[A-Za-z0-9._%+-]+" + "@" + r"(?!example\.invalid)[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
     ("gh token", re.compile("gh" + r"[pousr]_[A-Za-z0-9]{20,}")),
     ("sk token", re.compile("sk" + r"-[A-Za-z0-9]{20,}")),
+    ("matt" + "pocock", re.compile("matt" + "pocock", re.I)),
+    ("agent" + "memory", re.compile("agent" + "memory", re.I)),
+    ("soft" + "aworks", re.compile("soft" + "aworks", re.I)),
+    ("entire" + "io", re.compile("entire" + "io", re.I)),
+    ("pa" + "seo", re.compile("pa" + "seo", re.I)),
+    ("Continuous" + "-Claude", re.compile("Continuous" + "-Claude", re.I)),
+    ("skills" + ".sh", re.compile("skills" + r"\.sh", re.I)),
+    ("find" + "-skills", re.compile("find" + "-skills", re.I)),
 ]
 
 
@@ -292,6 +301,77 @@ class HandoffDocTests(Base):
     def test_M2_step6_lists_the_live_chain_check(self):
         self.matches(r"(?is)Live item.{0,160}previous handoff", self._step(6))
 
+    # --- 17. follow-up contract (documents) ---
+
+    def _carried_block(self):
+        return self._format_block().split("## Goal (carried)", 1)[1].split("\n---", 1)[0]
+
+    def test_F4_format_has_constraints_between_done_when_and_changes(self):
+        carried = self._carried_block()
+        keys = ["Origin", "Goal", "Done-when", "Constraints", "Changes"]
+        pos = [carried.find(f"- **{k}:**") for k in keys]
+        self.assertTrue(all(i >= 0 for i in pos), f"missing key: {pos}")
+        self.assertEqual(sorted(pos), pos, "keys are not in the order Origin, Goal, Done-when, Constraints, Changes")
+        line = [l for l in carried.splitlines() if l.startswith("- **Constraints:**")][0]
+        self.has("none", line)
+
+    def test_F4_goal_carried_is_described_with_five_keys(self):
+        self.has("with its five keys", self._step(5))
+        self.lacks("four keys", self._step(5))
+        self.lacks("four keys", self._step(6))
+        self.has("five keys", self._step(6))
+
+    def test_F4_step1_and_step5_copy_constraints_and_gate_removal_on_a_quote(self):
+        for n in (1, 5):
+            step = self._step(n)
+            self.matches(r"(?is)`Constraints`.{0,300}(verbatim|exactly as written)", step)
+            self.matches(r"(?is)`Constraints`.{0,500}(append|added at the end|add to the end)", step)
+            self.matches(r"(?is)(delete|remove|edit|change)[^.]{0,200}`Constraints`|`Constraints`[^.]{0,200}(delete|remove|edit|change)", step)
+        step5 = self._step(5)
+        self.matches(r"(?is)(delete|remove|edit|change).{0,300}quote.{0,300}`Changes`.{0,200}`Constraints:`", step5)
+
+    def test_F4_step6_lists_the_constraints_chain_check(self):
+        self.matches(r"(?is)`Constraints`.{0,300}`Changes`.{0,120}`Constraints:`", self._step(6))
+
+    def test_F1_step6_secret_check_fails_hides_value_and_names_redacted(self):
+        step6 = self._step(6)
+        self.matches(r"(?is)(fail\w*|exits 1).{0,80}secret|secret.{0,300}fail", step6)
+        self.matches(r"(?is)(never|not)[^.]{0,60}(print|show|output)[^.]{0,40}value", step6)
+        self.has("`REDACTED`", step6)
+        self.matches(r"(?is)REDACTED`[^.]{0,40}(no brackets|without brackets)", step6)
+
+    def test_F1_step6_goal_comparison_does_not_count_redaction_as_change(self):
+        self.matches(r"(?is)`Goal \(carried\)`[^.]{0,200}(not|never)[^.]{0,80}(redact|REDACTED|replacement)[^.]{0,60}change", self._step(6))
+
+    def test_F1_safety_rule_points_at_the_mechanical_check(self):
+        safety = self.text.split("## Safety rules", 1)[1].split("\n---", 1)[0]
+        self.has("REDACTED", safety)
+        self.matches(r"(?is)checker.{0,200}(scan|check)[^.]{0,120}(mechanical|by machine|automatic)|(mechanical|by machine|automatic)[^.]{0,80}checker", safety)
+        self.matches(r"(?is)secret.{0,200}(checker|Step 6)|(checker|Step 6).{0,200}secret", safety)
+
+    def test_F2_step6_keeps_over_cap_file_when_never_trim_list_is_kept(self):
+        step6 = self._step(6)
+        self.matches(r"(?is)never[- ]trim.{0,200}(still exceeds|still over|exceeds the cap|over the cap|over the limit)[^.]{0,200}(leave|left|keep|kept)", step6)
+
+    def test_M3_constraints_are_appended_by_item_with_semicolon(self):
+        self.assertNotRegex(self.text, r"text (may be|is) appended at its end")
+        self.assertGreaterEqual(len(re.findall(r"separated by `; `", self.text)), 2)
+        self.matches(r"existing\s+items\s+stay\s+exactly\s+as\s+they\s+are")
+        self.has("`none`")
+        self.matches(r"(?is)`none`[^.]{0,80}(zero items|no items|0 items)")
+
+    def test_M3_step6_chain_check_is_item_based(self):
+        step6 = self._step(6)
+        self.assertNotRegex(step6, r"previous value with text\s+appended")
+        self.matches(r"(?is)`Constraints`[^.]{0,120}items?[^.]{0,120}(previous|prefix|start)", step6)
+
+    def test_F2_step6_size_warning_follows_the_result_and_limit_is_fixed(self):
+        step6 = self._step(6)
+        self.matches(r"(?is)WARNING: handoff file is.{0,300}(after|follows|below)[^.]{0,80}result", step6)
+        self.matches(r"(?is)(fixed|always)[^.]{0,40}16 KiB", step6)
+        self.matches(r"(?is)`values`[^.]{0,200}(only|just)[^.]{0,120}Step 5", step6)
+        self.matches(r"(?is)checker[^.]{0,80}(does not|never) read", step6)
+
 
 class ResumeDocTests(Base):
     @classmethod
@@ -305,6 +385,13 @@ class ResumeDocTests(Base):
     def _table_rows(self):
         rows = [l for l in self.text.splitlines() if l.lstrip().startswith("|")]
         return rows
+
+    def test_F3_skipped_newer_warning_has_four_reasons_and_same_or_newer(self):
+        self.has("WARNING: newer handoff skipped (<reason>): <file name>")
+        for reason in ("no usable Exact Next Step", "empty file", "project unknown", "not valid UTF-8"):
+            self.has(f"`{reason}`")
+        self.matches(r"(?is)same (modification time )?or newer|as new as or newer|newer than or equal|at least as new")
+        self.matches(r"(?is)another project[^.]{0,120}(not|never)[^.]{0,40}(skipped|warn|reported|listed|counted)|(not|never)[^.]{0,60}another project")
 
     def test_L1_steps_table_header(self):
         headers = [r.lower() for r in self._table_rows()
@@ -448,11 +535,51 @@ class ResumeDocTests(Base):
         self.assertLess(step0.index("`branch:`"), step0.index("`head:`"))
         self.assertLess(step0.index("`head:`"), step0.index("`since handoff:`"))
 
+    # --- 17. follow-up contract (documents) ---
 
-class ReadmeTests(Base):
+    NEWER_WARNING = "WARNING: newer handoff skipped (<reason>): <file name>"
+
+    def test_F3_step1_states_the_newer_handoff_skipped_rule(self):
+        step1 = self._resume_step(1)
+        self.has(self.NEWER_WARNING, step1)
+        self.has("continue: no (newer handoff skipped)", step1)
+        self.matches(r"(?is)(as new as or )?newer than the chosen", step1)
+        self.matches(r"(?is)(at most 3|up to 3)[^.]{0,80}and N more", step1)
+        self.matches(r"(?is)(even with|also with|despite)[^.]{0,20}`--c`", step1)
+
+    def test_F3_step1_none_found_case_carries_the_same_warning(self):
+        step1 = self._resume_step(1)
+        tail = step1.split("none found for this project", 1)[1]
+        self.has("newer handoff skipped", tail)
+
+    def test_F3_step1_path_argument_is_not_affected(self):
+        step1 = self._resume_step(1)
+        self.matches(r"(?is)path argument[^.]{0,200}(not affected|unaffected|does not apply)|(not affected|unaffected)[^.]{0,80}path argument", step1)
+
+    def test_F3_step5_continue_no_row_lists_the_new_reason(self):
+        rows = [r for r in self._table_rows() if r.lstrip().startswith("| `continue: no`")]
+        self.assertTrue(rows, "no `continue: no` row in the Step 5 table")
+        self.has("continue: no (newer handoff skipped)", rows[0])
+        self.has("continue: no (project mismatch)", rows[0])
+
+    def test_F3_warnings_list_has_newer_skipped_and_no_size_warning(self):
+        warnings = self.text.split("## Warnings to include in the briefing", 1)[1].split("\n## ", 1)[0]
+        self.has("newer handoff skipped", warnings)
+        self.lacks("16 KiB", warnings)
+        self.lacks("over 16", warnings)
+
+    def test_F4_briefing_goal_block_shows_constraints_verbatim(self):
+        goal = self._briefing_block().split("GOAL (carried):", 1)[1].split("BLOCKERS / OPEN QUESTIONS:", 1)[0]
+        self.has("`Constraints`", goal)
+        self.matches(r"`Constraints`[^\n]*verbatim", goal)
+        self.assertLess(goal.index("`Done-when`"), goal.index("`Constraints`"))
+        self.assertLess(goal.index("`Constraints`"), goal.index("What We Are Building"))
+
+
+class ReadmeKoTests(Base):
     @classmethod
     def setUpClass(cls):
-        cls.text = read(README)
+        cls.text = read(README_KO)
 
     def _emphasized(self, word):
         pat = re.compile(r"^#+ .*" + re.escape(word) + r".*$|\*\*[^*\n]*" + re.escape(word) + r"[^*\n]*\*\*", re.M)
@@ -517,7 +644,7 @@ class ReadmeTests(Base):
     def test_C14_principle_section_documents_goal_carried_and_history_file(self):
         sec = self.text.split("## 맥락 이월", 1)[1].split("\n## ", 1)[0]
         for needle in ("Goal (carried)", "**Continues:**", "~/.claude/handoffs/history/", "이력 파일",
-                       "덧붙", "What Did NOT Work", "Discarded Hypotheses", "Closed (pointers)"):
+                       "이어 붙", "What Did NOT Work", "Discarded Hypotheses", "Closed (pointers)"):
             self.has(needle, sec)
         self.matches(r"기본(으로)?[^.\n]{0,30}읽지 않는다", sec)
 
@@ -570,10 +697,257 @@ class ReadmeTests(Base):
         self.has("(exists)")
         self.has("(new)")
 
+    # --- 17. follow-up contract (documents) ---
+
+    def test_F3_resume_flow_mentions_newer_handoff_skipped(self):
+        flow = self.text.split("### 한 바퀴 흐름", 1)[1].split("### 핸드오프 파일 안의 구조", 1)[0]
+        resume = flow.split("`/resume-handoff`(세션 B)", 1)[1]
+        first = resume.split("\n2. ", 1)[0]
+        self.has("WARNING: newer handoff skipped", first)
+        self.has("continue: no (newer handoff skipped)", first)
+
+    def test_F4_carry_table_lists_constraints(self):
+        sec = self.text.split("## 맥락 이월", 1)[1].split("\n### ", 1)[0]
+        rows = [l for l in sec.splitlines() if l.startswith("|") and "`Constraints`" in l]
+        self.assertTrue(rows, "no 맥락 이월 table row names Constraints")
+        self.matches(r"이어 붙", rows[0])
+        self.has("Constraints:", rows[0])
+
+    def test_F4_structure_table_goal_carried_row_lists_five_keys_in_order(self):
+        rows = [l for l in self.text.splitlines() if l.startswith("| `## Goal (carried)`")]
+        self.assertTrue(rows, "no Goal (carried) row in the structure table")
+        keys = ["`Origin`", "`Goal`", "`Done-when`", "`Constraints`", "`Changes`"]
+        pos = [rows[0].find(k) for k in keys]
+        self.assertTrue(all(i >= 0 for i in pos), f"missing key: {pos}")
+        self.assertEqual(sorted(pos), pos)
+
+
+    def test_language_switch_line_right_under_the_title(self):
+        lines = self.text.splitlines()
+        self.assertEqual("# session-handoff", lines[0])
+        self.assertEqual("[English](README.md) | 한국어", lines[2])
+
+    def test_no_forbidden_word_for_form(self):
+        # Built from the code point so this file never contains the word.
+        self.lacks(chr(0xAF34))
+
+
+class ReadmeTests(Base):
+    """README.md is the English counterpart of README.ko.md."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = read(README)
+
+    def _emphasized(self, word):
+        pat = re.compile(r"^#+ .*" + re.escape(word) + r".*$|\*\*[^*\n]*" + re.escape(word) + r"[^*\n]*\*\*", re.M)
+        return pat.search(self.text) is not None
+
+    def test_language_switch_line_right_under_the_title(self):
+        lines = self.text.splitlines()
+        self.assertEqual("# session-handoff", lines[0])
+        self.assertEqual("English | [한국어](README.ko.md)", lines[2])
+
+    def test_A11_what_to_write_emphasized(self):
+        self.assertTrue(self._emphasized("What Each Rules File Holds"))
+
+    def test_A11_overwrite_point_emphasized(self):
+        self.assertTrue(self._emphasized("Which Core Points Are Overridden"))
+
+    def test_A11_must_not_write_emphasized(self):
+        self.assertTrue(self._emphasized("What Must Not Be Written"))
+
+    def test_A11_mermaid_block(self):
+        self.assertGreaterEqual(self.text.count("```mermaid"), 1, "no mermaid block")
+
+    def test_A11_override_point_identifiers(self):
+        for ident in ("runner-completion", "state-files", "forbidden-writes", "values"):
+            self.has(ident)
+
+    def test_A11_install_section(self):
+        self.has("install.py")
+        self.has("--yes")
+
+    def test_H2_minimum_python_and_os_specific_commands(self):
+        self.has("Python 3.9")
+        self.has("python3 install.py")
+        self.has("py -3 install.py")
+
+    def test_L6_restore_procedure(self):
+        self.has("Restore")
+        self.has("session-handoff-<YYYYMMDD-HHMMSS>")
+
+    def test_L5_environment_variables_documented(self):
+        self.has("HANDOFF_LOG")
+        self.has("HANDOFF_CHECKER")
+        self.has("runs.jsonl")
+
+    def test_L5_context_budget_attachment_point(self):
+        self.has("context_budget.py")
+        self.has("context-budget:")
+
+    def test_M7_values_point_lists_short_id_format(self):
+        rows = [l for l in self.text.splitlines() if l.startswith("| `values`")]
+        self.assertTrue(rows and "short-id" in rows[0], "values row lacks short-id format")
+
+    def test_H5_resume_is_limited_to_this_project(self):
+        self.has("project key:")
+
+    def test_install_rewrites_command_interpreter(self):
+        self.has("python3 ~/.claude/scripts/")
+
+    def test_continue_word_is_kept_and_explained_once(self):
+        self.has("`계속`")
+        self.matches(r"“continue” in Korean")
+        self.assertEqual(1, self.text.count("“continue” in Korean"))
+
+    # --- 14. carried goal and history file ---
+
+    def test_C14_principle_paragraph(self):
+        self.has("## Context Carry-over")
+        self.has("The original goal and purpose, and the context still in progress, are kept across the whole chain")
+        self.has("Context that is finished or no longer needed is not carried")
+        self.has("recorded in the history file and then forgotten")
+
+    def test_C14_principle_section_documents_goal_carried_and_history_file(self):
+        sec = self.text.split("## Context Carry-over", 1)[1].split("\n## ", 1)[0]
+        for needle in ("Goal (carried)", "**Continues:**", "~/.claude/handoffs/history/", "history file",
+                       "append", "What Did NOT Work", "Discarded Hypotheses", "Closed (pointers)"):
+            self.has(needle, sec)
+        self.matches(r"does not read[^.\n]{0,60}by default", sec)
+
+    def test_C14_role_list_counts_the_new_fact(self):
+        head = self.text.split("## Overall Structure", 1)[0]
+        self.has("six facts", head)
+        self.has("context carry-over", head)
+        self.has("overall structure", head)
+
+    def test_structure_section_explains_the_whole_system(self):
+        sec = self.text.split("## Overall Structure", 1)[1].split("\n## ", 1)[0]
+        self.assertLess(self.text.index("## Overall Structure"), self.text.index("## Roles"))
+        for sub in ("### At a Glance", "### Components", "### Files Created at Run Time",
+                    "### One Round Trip", "### Structure of a Handoff File"):
+            self.has(sub, sec)
+        self.has("```mermaid", sec)
+        self.assertGreaterEqual(sec.count("```mermaid"), 2, "install and run diagrams")
+        for name in ("handoff_state.py", "check_handoff.py", "run_log.py", "install.py",
+                     "commands/handoff.md", "commands/resume-handoff.md"):
+            self.has(name, sec)
+        for path in ("~/.claude/handoffs/history/", "~/.claude/handoffs/.state/runs.jsonl",
+                     ".status.txt", "-session.tmp"):
+            self.has(path, sec)
+        for part in ("Goal (carried)", "Live subagents", "Live runners", "Live scheduled",
+                     "**Continues:**", "**Toplevel:**", "Closed (pointers)", "Exact Next Step",
+                     "continue: yes", "live subagent:"):
+            self.has(part, sec)
+
+    def test_C14_no_em_dash_in_readme(self):
+        self.lacks("—")
+
+    # --- 16. re-review contract (documents) ---
+
+    def test_M5_install_python_option_and_interpreter_line(self):
+        self.has("--python")
+        self.has("interpreter:")
+
+    def test_M5_install_warns_about_virtual_environment(self):
+        self.has("virtual environment")
+        self.has("WARNING: interpreter is inside a virtual environment")
+
+    def test_L12_exit_code_table_lists_internal_error_4(self):
+        rows = [l for l in self.text.splitlines() if re.match(r"\|\s*`?4`?\s*\|", l)]
+        self.assertTrue(rows, "no exit code table row for 4")
+        self.has("internal error", rows[0].lower())
+        for code in ("0", "1", "2", "3"):
+            self.matches(rf"(?m)^\|\s*`?{code}`?\s*\|")
+
+    def test_L13_history_file_line_shows_exists_or_new(self):
+        self.has("(exists)")
+        self.has("(new)")
+
+    # --- 17. follow-up contract (documents) ---
+
+    def test_F3_resume_flow_mentions_newer_handoff_skipped(self):
+        flow = self.text.split("### One Round Trip", 1)[1].split("### Structure of a Handoff File", 1)[0]
+        resume = flow.split("`/resume-handoff` (session B)", 1)[1]
+        first = resume.split("\n2. ", 1)[0]
+        self.has("WARNING: newer handoff skipped", first)
+        self.has("continue: no (newer handoff skipped)", first)
+
+    def test_F4_carry_table_lists_constraints(self):
+        sec = self.text.split("## Context Carry-over", 1)[1].split("\n### ", 1)[0]
+        rows = [l for l in sec.splitlines() if l.startswith("|") and "`Constraints`" in l]
+        self.assertTrue(rows, "no Context Carry-over table row names Constraints")
+        self.matches(r"(?i)new items", rows[0])
+        self.has("Constraints:", rows[0])
+
+    def test_F4_structure_table_goal_carried_row_lists_five_keys_in_order(self):
+        rows = [l for l in self.text.splitlines() if l.startswith("| `## Goal (carried)`")]
+        self.assertTrue(rows, "no Goal (carried) row in the structure table")
+        keys = ["`Origin`", "`Goal`", "`Done-when`", "`Constraints`", "`Changes`"]
+        pos = [rows[0].find(k) for k in keys]
+        self.assertTrue(all(i >= 0 for i in pos), f"missing key: {pos}")
+        self.assertEqual(sorted(pos), pos)
+
+
+class ReadmePairTests(unittest.TestCase):
+    """The two READMEs must keep the same structure."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.en = read(README)
+        cls.ko = read(README_KO)
+
+    @staticmethod
+    def count(pattern, text):
+        return len(re.findall(pattern, text, re.M))
+
+    def test_h2_headings_have_the_same_count(self):
+        self.assertEqual(self.count(r"^## ", self.ko), self.count(r"^## ", self.en))
+
+    def test_h3_headings_have_the_same_count(self):
+        self.assertEqual(self.count(r"^### ", self.ko), self.count(r"^### ", self.en))
+
+    def test_h4_headings_have_the_same_count(self):
+        self.assertEqual(self.count(r"^#### ", self.ko), self.count(r"^#### ", self.en))
+
+    def test_mermaid_blocks_have_the_same_count(self):
+        self.assertEqual(self.count(r"^```mermaid", self.ko), self.count(r"^```mermaid", self.en))
+
+    def test_table_rows_have_the_same_count(self):
+        self.assertEqual(self.count(r"^\|", self.ko), self.count(r"^\|", self.en))
+
+    def test_neither_readme_has_forbidden_strings(self):
+        found = []
+        for name, text in (("README.md", self.en), ("README.ko.md", self.ko)):
+            for n, line in enumerate(text.splitlines(), 1):
+                for label, rx in FORBIDDEN:
+                    if rx.search(line):
+                        found.append(f"{name}:{n}: {label}")
+        self.assertEqual([], found, "forbidden strings:\n" + "\n".join(found))
+
+    def test_M3_both_readmes_say_constraints_grow_by_items_with_semicolon(self):
+        self.assertIn("`; `", self.en)
+        self.assertIn("`; `", self.ko)
+        self.assertNotIn("Only appending to `Constraints` is free", self.en)
+        self.assertNotIn("Appending at the end is free", self.en)
+        self.assertNotIn("`Constraints`는 뒤에 덧붙이는 것만 자유다", self.ko)
+        self.assertNotIn("뒤에 덧붙이는 것은 자유다", self.ko)
+
+    def test_F3_both_readmes_list_the_four_skip_reasons(self):
+        for text in (self.en, self.ko):
+            self.assertIn("WARNING: newer handoff skipped (<", text)
+            for reason in ("no usable Exact Next Step", "empty file", "project unknown", "not valid UTF-8"):
+                self.assertIn(reason, text)
+
+    def test_neither_readme_has_an_em_dash(self):
+        self.assertNotIn("—", self.en)
+        self.assertNotIn("—", self.ko)
+
 
 HANDLING_VALUES = [
-    "유지", "이름 변경", "분리", "선택 줄", "프로젝트 덮어쓰기 지점",
-    "스크립트 출력으로 대체", "제거(사용자 결정)",
+    "keep", "rename", "split", "optional line", "project override point",
+    "replaced by script output", "removed (user decision)",
 ]
 
 
@@ -596,17 +970,18 @@ class FieldMapTests(Base):
 
     def test_closing_line_counts_match_the_table(self):
         total = len(self.rows)
-        removed = sum(1 for r in self.rows if r[4].startswith("제거"))
-        last = [l for l in self.text.splitlines() if l.startswith("대조 결과:")]
+        removed = sum(1 for r in self.rows if r[4].startswith("removed"))
+        last = [l for l in self.text.splitlines() if l.startswith("Cross-check result:")]
         self.assertEqual(1, len(last))
-        expected = f"대조 결과: 현행 {total}개 · 새 양식에 위치 있음 {total - removed}개 · 사용자 결정 제거 {removed}개 · 빠짐 0개"
+        expected = (f"Cross-check result: current {total} · located in the new format {total - removed}"
+                    f" · removed by user decision {removed} · missing 0")
         self.assertEqual(expected, last[0])
 
     def test_handling_value_list_in_prose_matches_the_values_in_use(self):
         used = {r[4] for r in self.rows}
         self.assertTrue(used <= set(HANDLING_VALUES))
-        self.matches(rf"{len(HANDLING_VALUES)}가지|{len(HANDLING_VALUES)} 가지|일곱 가지|여덟 가지")
-        self.lacks("사용자 층으로 이동")
+        self.matches(rf"(?i)\b(seven|{len(HANDLING_VALUES)}) handling values")
+        self.lacks("moved to the user layer")
 
     def test_live_scheduled_and_runner_id_are_reflected(self):
         self.has("Live scheduled")
@@ -617,21 +992,32 @@ class FieldMapTests(Base):
         self.has("Live scheduled", rows["40"][3] + rows["40"][5])
 
     def test_removed_rows_are_the_auto_resume_rows_and_the_session_continue_rule(self):
-        removed = [int(r[0]) for r in self.rows if r[4].startswith("제거")]
+        removed = [int(r[0]) for r in self.rows if r[4].startswith("removed")]
         self.assertEqual([6, 7, 8, 9, 10, 141], removed)
 
     def test_rows_that_changed_are_not_marked_unchanged(self):
         rows = {r[0]: r for r in self.rows}
         for n in ("43", "76", "81", "82", "84"):
-            self.assertNotEqual("유지", rows[n][4], f"row {n}")
+            self.assertNotEqual("keep", rows[n][4], f"row {n}")
+
+    def test_handling_value_distribution_is_unchanged(self):
+        counts = {}
+        for r in self.rows:
+            counts[r[4]] = counts.get(r[4], 0) + 1
+        self.assertEqual(145, len(self.rows))
+        self.assertEqual(
+            {"keep": 116, "rename": 5, "split": 10, "optional line": 2,
+             "project override point": 3, "replaced by script output": 3,
+             "removed (user decision)": 6},
+            counts,
+        )
 
     def test_no_dates_or_outside_references_in_body(self):
         self.assertIsNone(re.search(r"20[0-9]{2}-[0-9]{2}-[0-9]{2}", self.text))
-        self.assertIsNone(re.search(r"판정문", self.text))
-        self.assertIsNone(re.search(r"결정 표", self.text))
+        self.assertIsNone(re.search(r"(?i)decision table|judgment", self.text))
 
     def test_intro_says_it_is_a_record_of_the_migration(self):
-        self.has("이관 시점의 대조 기록")
+        self.has("record of the cross-check made at the time of the migration")
 
 
 def tracked_files():
@@ -651,7 +1037,7 @@ def tracked_files():
 class PublicScanTests(unittest.TestCase):
     def test_A9_scans_the_files_git_would_publish(self):
         names = {p.relative_to(ROOT).as_posix() for p in tracked_files()}
-        for expected in ("README.md", "commands/handoff.md", "docs/field-map.md", "tests/test_docs.py"):
+        for expected in ("README.md", "README.ko.md", "commands/handoff.md", "docs/field-map.md", "tests/test_docs.py"):
             self.assertIn(expected, names)
         self.assertFalse([n for n in names if n.startswith("scratch/")])
 

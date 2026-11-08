@@ -845,6 +845,262 @@ class TemplateCandidateTests(StateTestCase):
         self.assertIn("none found", self.lines_with(proc.stdout, "handoff: ")[0], proc.stdout)
 
 
+# --- F3: a newer handoff of this project without a usable Exact Next Step is reported ---------------
+class NewerSkippedTests(StateTestCase):
+    WARN = "WARNING: newer handoff skipped (no usable Exact Next Step):"
+    SKIP = "WARNING: newer handoff skipped "
+    OLD, NEW = 1_700_000_000, 1_800_000_000
+    NEW_NAME = "2026-11-02-new-session.tmp"
+
+    def setUp(self):
+        super().setUp()
+        self.init_repo({"a.txt": "a\n"})
+
+    def broken_text(self, toplevel=None):
+        return self.valid_handoff_text(toplevel=toplevel).replace(
+            "Run the unit tests and read the first failure.", "[next step]")
+
+    def pair(self, old="2026-11-01-old-session.tmp", new="2026-11-02-new-session.tmp"):
+        old_path = self.write_handoff(old, self.valid_handoff_text(), mtime=self.OLD)
+        self.write_handoff(new, self.broken_text(), mtime=self.NEW)
+        return old_path
+
+    def test_F3_broken_newer_file_is_reported_and_continue_is_no(self):
+        old = self.pair()
+        proc = self.run_state("--resume", "--c")
+        out = self.combined(proc)
+        self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {old}"], out)
+        self.assertEqual(self.lines_with(out, self.WARN), [f"{self.WARN} 2026-11-02-new-session.tmp"], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: no (newer handoff skipped)"], out)
+        self.assertEqual(proc.returncode, 0, out)
+
+    def test_F3_continue_is_no_with_the_reason_even_without_a_continue_token(self):
+        self.pair()
+        out = self.combined(self.run_state("--resume"))
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: no (newer handoff skipped)"], out)
+
+    def test_F3_run_log_records_the_continue_reason(self):
+        self.pair()
+        self.run_state("--resume", "--c")
+        recs = [json.loads(ln) for ln in (self.tmp / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
+        resume = [r for r in recs if r["mode"] == "resume"]
+        self.assertEqual([r["continue"] for r in resume], ["no (newer handoff skipped)"])
+        self.assertTrue(any(w.startswith(self.WARN) for w in resume[0]["warnings"]), resume[0])
+
+    def test_F3_broken_file_of_another_project_is_not_reported(self):
+        old = self.write_handoff("2026-11-01-old-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        other = (self.tmp / "other").as_posix()
+        self.write_handoff("2026-11-02-new-session.tmp", self.broken_text(toplevel=other), mtime=self.NEW)
+        out = self.combined(self.run_state("--resume", "--c"))
+        self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {old}"], out)
+        self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"), [], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: yes (--c)"], out)
+
+    def test_F3_explicit_path_is_not_affected(self):
+        old = self.pair()
+        out = self.combined(self.run_state("--resume", "--c", str(old)))
+        self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {old}"], out)
+        self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"), [], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: yes (--c)"], out)
+
+    def test_F3_only_a_broken_file_is_none_found_with_the_warning(self):
+        self.write_handoff("2026-11-02-new-session.tmp", self.broken_text(), mtime=self.NEW)
+        proc = self.run_state("--resume")
+        out = self.combined(proc)
+        self.assertEqual(self.lines_with(out, "handoff: "), ["handoff: none found for this project"], out)
+        self.assertEqual(self.lines_with(out, self.WARN), [f"{self.WARN} 2026-11-02-new-session.tmp"], out)
+        self.assertEqual(proc.returncode, 1, out)
+
+    def test_F3_warnings_are_capped_at_3_lines(self):
+        self.write_handoff("2026-11-01-old-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        for i in range(5):
+            self.write_handoff(f"2026-11-0{i + 2}-broken{i}-session.tmp", self.broken_text(), mtime=self.NEW + i)
+        out = self.combined(self.run_state("--resume"))
+        warns = self.lines_with(out, self.WARN)
+        self.assertEqual(len(warns), 3, out)
+        self.assertEqual(warns[0], f"{self.WARN} 2026-11-06-broken4-session.tmp", "newest first")
+        self.assertEqual(warns[-1], f"{self.WARN} … and 3 more")
+
+    def test_F3_broken_file_older_than_the_chosen_one_is_not_reported(self):
+        self.write_handoff("2026-11-01-old-session.tmp", self.broken_text(), mtime=self.OLD)
+        new = self.write_handoff("2026-11-02-new-session.tmp", self.valid_handoff_text(), mtime=self.NEW)
+        out = self.combined(self.run_state("--resume", "--c"))
+        self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {new}"], out)
+        self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"), [], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: yes (--c)"], out)
+
+    def test_F3_slug_selector_reports_a_newer_broken_match(self):
+        old = self.write_handoff("2026-11-01-alpha-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        self.write_handoff("2026-11-02-alpha2-session.tmp", self.broken_text(), mtime=self.NEW)
+        out = self.combined(self.run_state("--resume", "--c", "alpha"))
+        self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {old}"], out)
+        self.assertEqual(self.lines_with(out, self.WARN), [f"{self.WARN} 2026-11-02-alpha2-session.tmp"], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: no (newer handoff skipped)"], out)
+
+    def test_F3_date_selector_reports_a_newer_broken_match(self):
+        old = self.write_handoff("2026-11-02-a-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        self.write_handoff("2026-11-02-b-session.tmp", self.broken_text(), mtime=self.NEW)
+        out = self.combined(self.run_state("--resume", "--c", "2026-11-02"))
+        self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {old}"], out)
+        self.assertEqual(self.lines_with(out, self.WARN), [f"{self.WARN} 2026-11-02-b-session.tmp"], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: no (newer handoff skipped)"], out)
+
+    def test_F3_undecodable_file_without_a_head_is_also_skipped_as_not_valid_utf8(self):
+        # 18.3 ④: undecodable and its head (read with errors="replace") names no project
+        old = self.write_handoff("2026-11-01-old-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        self.write_raw("2026-11-02-bad-session.tmp", b"\xff\xfe\xfd not utf-8\n" * 20, self.NEW)
+        out = self.combined(self.run_state("--resume", "--c"))
+        self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {old}"], out)
+        self.assertEqual(self.lines_with(out, "WARNING: unreadable handoff skipped:"),
+                         ["WARNING: unreadable handoff skipped: 2026-11-02-bad-session.tmp"], out)
+        self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"),
+                         [f"{self.SKIP}(not valid UTF-8): 2026-11-02-bad-session.tmp"], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: no (newer handoff skipped)"], out)
+
+    # --- 18.3 (M2): residual paths. Each case is checked newer than and as new as the chosen file. ---
+    def write_raw(self, name, data, mtime):
+        p = self.handoffs / name
+        p.write_bytes(data)
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def unknown_project_text(self):
+        return self.valid_handoff_text().replace("**Project:** sample", "**Project:** [project name]").replace(
+            f"**Toplevel:** {self.repo.as_posix()}", "**Toplevel:** [absolute path]")
+
+    def truncated_bytes(self, toplevel=None):
+        """A write cut in the middle of a Korean character: the head survives, the tail is not UTF-8."""
+        data = (self.valid_handoff_text(toplevel=toplevel) + "\n## Background\n한국어 본문\n").encode("utf-8")
+        cut = data.index("한".encode("utf-8")) + 2
+        return data[:cut]
+
+    def assert_skipped_both_ways(self, reason, data, extra=()):
+        """`data` (bytes) as the newer file: newer, then the same mtime as the chosen file."""
+        for when in (self.NEW, self.OLD):
+            with self.subTest(mtime="newer" if when == self.NEW else "same"):
+                for p in self.handoffs.glob("*-session.tmp"):
+                    p.unlink()
+                old = self.write_handoff("2026-11-01-old-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+                self.write_raw(self.NEW_NAME, data, when)
+                proc = self.run_state("--resume", "--c")
+                out = self.combined(proc)
+                self.assertNotIn("Traceback", out)
+                self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {old}"], out)
+                self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"),
+                                 [f"{self.SKIP}({reason}): {self.NEW_NAME}"], out)
+                self.assertEqual(self.lines_with(out, "continue:"), ["continue: no (newer handoff skipped)"], out)
+                for line in extra:
+                    self.assertIn(line, out.splitlines(), out)
+                self.assertEqual(proc.returncode, 0, out)
+
+    def test_F3_empty_newer_file_is_skipped(self):
+        self.assert_skipped_both_ways("empty file", b"")
+
+    def test_F3_newer_file_with_placeholder_toplevel_and_project_is_skipped(self):
+        text = self.unknown_project_text()
+        self.assertIsNone(re.search(r"^\*\*(Project|Toplevel):\*\* [^\[]", text, re.M), text)
+        broken = text.replace("Run the unit tests and read the first failure.", "[next step]")
+        self.assert_skipped_both_ways("project unknown", broken.encode("utf-8"))
+
+    def test_F3_newer_file_of_unknown_project_is_skipped_even_with_a_next_step(self):
+        self.assert_skipped_both_ways("project unknown", self.unknown_project_text().encode("utf-8"))
+
+    def test_F3_newer_file_cut_inside_a_utf8_character_is_skipped(self):
+        data = self.truncated_bytes()
+        with self.assertRaises(UnicodeDecodeError):
+            data.decode("utf-8")
+        self.assert_skipped_both_ways("not valid UTF-8", data,
+                                      extra=[f"WARNING: unreadable handoff skipped: {self.NEW_NAME}"])
+
+    def test_F3_file_without_a_next_step_as_new_as_the_chosen_one_is_skipped(self):
+        # catches `>=` written back as `>`: the old suite had no equal-mtime case
+        self.assert_skipped_both_ways("no usable Exact Next Step", self.broken_text().encode("utf-8"))
+
+    def test_F3_undecodable_file_of_another_project_keeps_only_its_unreadable_warning(self):
+        old = self.write_handoff("2026-11-01-old-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        self.write_raw(self.NEW_NAME, self.truncated_bytes(toplevel=(self.tmp / "other").as_posix()), self.NEW)
+        out = self.combined(self.run_state("--resume", "--c"))
+        self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {old}"], out)
+        self.assertEqual(self.lines_with(out, "WARNING: unreadable handoff skipped:"),
+                         [f"WARNING: unreadable handoff skipped: {self.NEW_NAME}"], out)
+        self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"), [], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: yes (--c)"], out)
+
+    def test_F3_empty_file_older_than_the_chosen_one_is_not_reported(self):
+        self.write_raw("2026-11-01-empty-session.tmp", b"", self.OLD - 1)
+        new = self.write_handoff("2026-11-02-new-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        out = self.combined(self.run_state("--resume", "--c"))
+        self.assertEqual(self.lines_with(out, "handoff: "), [f"handoff: {new}"], out)
+        self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"), [], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: yes (--c)"], out)
+
+    def test_F3_valid_file_as_new_as_the_chosen_one_is_not_reported(self):
+        self.write_handoff("2026-11-01-a-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        self.write_handoff("2026-11-01-b-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        out = self.combined(self.run_state("--resume", "--c"))
+        self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"), [], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: yes (--c)"], out)
+
+    def test_F3_mixed_reasons_count_as_one_kind_capped_at_3_lines(self):
+        self.write_handoff("2026-11-01-old-session.tmp", self.valid_handoff_text(), mtime=self.OLD)
+        self.write_raw("2026-11-02-a-session.tmp", b"", self.NEW + 3)
+        self.write_raw("2026-11-02-b-session.tmp", self.unknown_project_text().encode("utf-8"), self.NEW + 2)
+        self.write_raw("2026-11-02-c-session.tmp", self.truncated_bytes(), self.NEW + 1)
+        self.write_raw("2026-11-02-d-session.tmp", self.broken_text().encode("utf-8"), self.NEW)
+        out = self.combined(self.run_state("--resume", "--c"))
+        self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"), [
+            f"{self.SKIP}(empty file): 2026-11-02-a-session.tmp",
+            f"{self.SKIP}(project unknown): 2026-11-02-b-session.tmp",
+            f"{self.SKIP}(not valid UTF-8, no usable Exact Next Step): … and 2 more",
+        ], out)
+        self.assertEqual(self.lines_with(out, "continue:"), ["continue: no (newer handoff skipped)"], out)
+
+    def test_F3_default_mode_prints_no_skipped_warning(self):
+        old = self.pair()
+        out = self.combined(self.run_state())
+        self.assertEqual(self.lines_with(out, "WARNING: newer handoff skipped"), [], out)
+        self.assertEqual(self.lines_with(out, "previous handoff:"), [f"previous handoff: {old}"], out)
+
+
+# --- F2/17.3: resume mode hides the checker's size warning (a resume cannot shrink the file) ----------
+class SizeWarningHiddenTests(StateTestCase):
+    SIZE = "WARNING: handoff file is"
+
+    def setUp(self):
+        super().setUp()
+        self.init_repo({"a.txt": "a\n"})
+        self.fake = FIXTURES / "fake_checker.py"
+
+    def resume_with_fake(self, mode):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        return self.run_state("--resume", extra_env={"HANDOFF_CHECKER": str(self.fake), "FAKE_CHECKER_MODE": mode})
+
+    def test_F2_size_warning_is_not_shown_in_resume_output(self):
+        out = self.combined(self.resume_with_fake("sizewarn"))
+        self.assertNotIn(self.SIZE, out)
+        self.assertIn("  [PASS] all checks passed", out)
+        self.assertEqual(self.lines_with(out, "handoff check:"), ["handoff check: exit 0"], out)
+
+    def test_F2_size_warning_does_not_use_up_the_excerpt_cap(self):
+        out = self.combined(self.resume_with_fake("sizewarn_cap"))
+        self.assertNotIn(self.SIZE, out)
+        self.assertEqual(len([ln for ln in out.splitlines() if ln.startswith("  ")]), 8, out)
+        self.assertNotIn("more", out)
+
+    def test_F2_checker_run_record_keeps_the_size_warning(self):
+        text = self.valid_handoff_text() + "\n" + "padding line that only adds size\n" * 600
+        self.assertGreater(len(text.encode("utf-8")), 16 * 1024)
+        self.write_handoff("2026-11-01-work-session.tmp", text)
+        proc = self.run_state("--resume")
+        self.assertNotIn(self.SIZE, self.combined(proc))
+        recs = [json.loads(ln) for ln in (self.tmp / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
+        check = [r for r in recs if r["mode"] == "check"]
+        self.assertEqual(len(check), 1, recs)
+        self.assertTrue(any(ln.startswith(self.SIZE) for ln in check[0]["stdout"]), check[0])
+        resume = [r for r in recs if r["mode"] == "resume"]
+        self.assertFalse(any(self.SIZE in ln for ln in resume[0]["stdout"]), resume[0])
+
+
 # --- L-9: exit codes and branch name ----------------------------------------------------
 class ExitCodeTests(StateTestCase):
     NON_GIT_HANDOFF = (
@@ -854,7 +1110,7 @@ class ExitCodeTests(StateTestCase):
         "- **Live runners:** none\n- **Live scheduled:** none\n\n"
         "## Goal (carried)\n\n- **Origin:** /home/u/.claude/handoffs/2026-11-01-plain-session.tmp · 2026-11-01\n"
         "- **Goal:** Check the plain folder. User: \"check it\"\n"
-        "- **Done-when:** the check passes\n- **Changes:** none\n\n"
+        "- **Done-when:** the check passes\n- **Constraints:** none\n- **Changes:** none\n\n"
         "## Decisions Made\n\nNo major decisions made this session.\n\n"
         "## Exact Next Step\n\nRun the unit tests.\n"
     )

@@ -18,6 +18,7 @@
 - **Origin:** /home/u/.claude/handoffs/2026-11-01-sample-session.tmp · 2026-11-01
 - **Goal:** Add a parser and keep the old behavior. User: "keep the old behavior"
 - **Done-when:** the unit tests pass
+- **Constraints:** none
 - **Changes:** none
 
 ## Decisions Made

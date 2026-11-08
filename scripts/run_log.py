@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2026.11.08-1"
+VERSION = "2026.11.09-1"
 MAX_BYTES = 5 * 1024 * 1024
 
 
