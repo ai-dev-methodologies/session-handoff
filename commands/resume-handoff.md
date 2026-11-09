@@ -234,4 +234,5 @@ Decisions Made or Requirement Changes does not count.
 - To save the new session later, run `/handoff` again. It writes a new file.
 - Both scripts append one JSON line per run to `~/.claude/handoffs/.state/runs.jsonl` (the handoff
   file's path, never its body). When the user later asks what happened, read that file together
-  with the handoff file it names.
+  with the handoff file it names. Run `python3 ~/.claude/scripts/run_report.py` only when the user
+  asks what happened: it summarizes that file and is not part of Steps 0–3.

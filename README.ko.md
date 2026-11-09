@@ -26,7 +26,7 @@
 flowchart TD
     subgraph REPO["이 저장소 (정본)"]
         C["commands/<br/>handoff.md · resume-handoff.md"]
-        S["scripts/<br/>handoff_state.py · check_handoff.py · run_log.py"]
+        S["scripts/<br/>handoff_state.py · check_handoff.py · run_log.py · run_report.py"]
         I["install.py"]
     end
     subgraph HOME["~/.claude (설치본)"]
@@ -85,7 +85,8 @@ flowchart TD
 | `scripts/handoff_state.py` | 두 명령의 Step 0에서 한 번 실행한다. 공통 출력은 git 상태 요약·규칙 파일 경로·상태 목록 파일 경로다. `/handoff`는 이전 핸드오프·이력 파일 경로를 더 낸다. `--resume`은 고른 핸드오프·`continue:` 줄·서브에이전트 상태·검사 결과를 더 낸다 | `~/.claude/scripts/` |
 | `scripts/check_handoff.py` | 핸드오프 파일이 양식을 지켰는지 검사한다. `/handoff` Step 6과 `handoff_state.py`가 부른다 | `~/.claude/scripts/` |
 | `scripts/run_log.py` | 두 스크립트의 실행 결과를 `runs.jsonl`에 1줄씩 남긴다 | `~/.claude/scripts/` |
-| `install.py` | 위 5개 파일을 설치한다. 바뀌는 기존 파일은 먼저 백업한다. 저장소에만 있다 | 설치하지 않음 |
+| `scripts/run_report.py` | `runs.jsonl`을 한 명령으로 요약한다. 읽기만 한다. 무슨 일이 있었는지 알고 싶을 때만 실행한다 | `~/.claude/scripts/` |
+| `install.py` | 위 6개 파일을 설치한다. 바뀌는 기존 파일은 먼저 백업한다. 저장소에만 있다 | 설치하지 않음 |
 | `tests/` | 위 파일의 동작을 고정하는 테스트다 | 설치하지 않음 |
 | `docs/field-map.md` | 옛 양식의 필드가 새 양식의 어디로 갔는지 대조한 기록이다 | 설치하지 않음 |
 
@@ -209,6 +210,34 @@ flowchart TD
 - 결과를 물을 때는 이 파일과 거기에 적힌 핸드오프 파일 경로를 보면 된다.
 - 파일이 5 MB를 넘으면 `runs.jsonl.1`로 이름을 바꾸고 새로 시작한다.
 
+### 실행 기록 보고
+`run_report.py`는 실행 기록(`runs.jsonl.1`이 있으면 함께)을 읽어 무슨 일이 있었고 무엇을 고칠지 보여 준다. 기록에는 쓰지 않는다. 기록의 `stdout`과 `args` 원문은 출력하지 않는다. 보고 출력에는 로컬 경로와 세션 id가 들어 있으므로 공개 저장소에 보고 출력을 붙여 넣지 않는다.
+
+기록 한 줄은 키 19개를 가진다. 아래 5개가 가장 새 키다. 값이 없는 키는 `null`이다. 옛 버전이 쓴 줄에는 이 키가 없고, 보고는 그런 줄을 Coverage에서 센다.
+
+| 키 | 내용 |
+|---|---|
+| `session_id` | `CLAUDE_CODE_SESSION_ID` 값. UUID 형식(16진수 8-4-4-4-12자리)일 때만 남기고, 그 밖에는 `null`이다 |
+| `caller` | `handoff_state.py`가 검사기를 실행했을 때 `HANDOFF_CALLER`로 전달한 `handoff_state.py`. 그 밖은 `null` |
+| `project` | 프로젝트 키. 검사 실행은 검사한 파일의 `**Toplevel:**`이 존재하는 절대 경로 폴더일 때 그 값 |
+| `fail_codes` | `check_handoff.py`만 쓴다. 고정된 실패 코드와 개수의 객체이고 통과하면 `{}`다. `handoff_state.py` 기록은 `null` |
+| `handoff_bytes` | `check_handoff.py`만 쓴다. 줄바꿈을 LF로 맞춘 뒤 검사한 본문의 UTF-8 바이트 수(검사기의 `WARNING: handoff file is <N> KiB` 줄과 같은 기준) |
+
+```
+python3 ~/.claude/scripts/run_report.py [--log PATH] [--since DATE] [--project PATH] [--version V] [--json]
+```
+
+| 옵션 | 뜻 |
+|---|---|
+| `--log PATH` | 읽을 기록 파일. 기본은 실행 기록 경로이고 `HANDOFF_LOG`를 따른다 |
+| `--since DATE` | 그 날짜 이후 기록만. 형식은 `YYYY-MM-DD` 또는 `YYYY-MM-DDTHH:MM:SSZ` |
+| `--project PATH` | 그 프로젝트의 기록만 |
+| `--version V` | 그 버전의 기록만. `V`는 `V-<n>`과 `V.<n>`도 포함한다 |
+| `--json` | 같은 내용을 고정 키 JSON으로 낸다 |
+
+- 종료 코드 0: 보고를 출력했다. 기록 파일이 없거나 비어 있을 때도 같다.
+- 종료 코드 2: 사용법 오류(예: 잘못된 `--since` 값, `--log` 없이 `HANDOFF_LOG=off`), 읽을 수 없는 기록 경로, 또는 내부 오류(stderr 1줄, traceback 없음).
+
 ## 종료 코드
 `handoff_state.py`의 종료 코드다.
 
@@ -233,6 +262,8 @@ flowchart TD
 |---|---|
 | `HANDOFF_LOG` | 실행 기록 파일의 경로. 값이 `off`면 기록하지 않는다 |
 | `HANDOFF_CHECKER` | `handoff_state.py`가 부르는 검사기의 경로. 없으면 `handoff_state.py`와 같은 폴더의 `check_handoff.py`를 쓴다 |
+| `CLAUDE_CODE_SESSION_ID` | Claude Code가 정한다. UUID 형식(16진수 8-4-4-4-12자리)일 때만 실행 기록에 `session_id`로 남기고, 그 밖에는 `null`이다. 다른 변수는 기록하지 않는다 |
+| `HANDOFF_CALLER` | `handoff_state.py`가 자신이 실행하는 검사기에 정한다. 값이 `handoff_state.py`일 때만 실행 기록에 `caller`로 남긴다 |
 
 `~/.claude/scripts/context_budget.py`가 있으면 `handoff_state.py`가 그 파일을 불러 `context-budget:` 줄을 낸다. 없으면 줄을 내지 않는다. 이 파일은 이 저장소에 없고 `install.py`도 건드리지 않는다.
 

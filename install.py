@@ -21,6 +21,7 @@ MAPPING = [
     ("scripts/handoff_state.py", "scripts/handoff_state.py"),
     ("scripts/check_handoff.py", "scripts/check_handoff.py"),
     ("scripts/run_log.py", "scripts/run_log.py"),
+    ("scripts/run_report.py", "scripts/run_report.py"),
 ]
 
 # command documents whose script calls are rewritten to the installing interpreter and --dst

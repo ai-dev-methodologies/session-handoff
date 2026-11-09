@@ -5,7 +5,9 @@ Test names carry the review-verdict item id (M1, A3, ...). A negative test asser
 needle the message must carry (an item name, a field label, a section title), so a handoff that already
 fails for an unrelated reason cannot turn a negative test green.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -14,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts" / "check_handoff.py"
@@ -153,6 +156,8 @@ class CheckerCase(unittest.TestCase):
     def env(self, **extra):
         env = dict(os.environ, HOME=str(self.home), USERPROFILE=str(self.home),
                    HANDOFF_LOG=str(self.tmp / "runs.jsonl"))
+        for name in ("CLAUDE_CODE_SESSION_ID", "HANDOFF_CALLER"):  # a developer's own session must not leak into a record
+            env.pop(name, None)
         env.update(extra)
         return env
 
@@ -1475,6 +1480,385 @@ class TemplateFixtureTest(unittest.TestCase):
         for fixture in (VALID, PREVIOUS):
             with self.subTest(fixture=fixture.name):
                 self.assertNotIn("this file", fixture.read_text(encoding="utf-8"))
+
+
+# --- R5/R6: run log signals (fail_codes, handoff_bytes, project) -----------------------------------
+BASE_COMMIT = "c34a100e08ab4c4fc09f7ab3abaa31ae36281fad"
+BODY_SENTINEL = "body" + "sentinel" + "-7731"
+
+
+def tail_record(path):
+    return json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+
+
+class SignalCase(CheckerCase):
+    def record(self, proc=None):
+        """The last run-log record of this test's runs.jsonl."""
+        return tail_record(self.tmp / "runs.jsonl")
+
+    def codes_of(self, text, **kw):
+        self.run_text(text, **kw)
+        return self.record()["fail_codes"]
+
+    def call_run(self, argv):
+        """checker.run(argv) in this process: (exit code, stdout, stderr, module)."""
+        mod = load_checker()
+        out, err = io.StringIO(), io.StringIO()
+        env = {"HOME": str(self.home), "USERPROFILE": str(self.home), "HANDOFF_LOG": str(self.tmp / "runs.jsonl")}
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            os.environ.pop("HANDOFF_CALLER", None)
+            code = mod.run(argv)
+        return code, out.getvalue(), err.getvalue(), mod
+
+    def records(self):
+        path = self.tmp / "runs.jsonl"
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def write(self, text, name="h.md"):
+        path = self.tmp / name
+        path.write_text(text, encoding="utf-8", newline="\n")
+        return path
+
+
+class FailCodeTest(SignalCase):
+    def with_note(self, lines):
+        return set_section(self.base, "Environment & Setup Notes", "\n".join(lines), sep=False)
+
+    def test_R5_pass_gives_empty_object(self):
+        self.assertPasses(self.run_text(self.base, args=("--git", "yes")))
+        self.assertEqual(self.record()["fail_codes"], {})
+
+    def test_R5_secret_code_by_kind(self):
+        text = self.with_note([f"Set the variable to {TOKEN} before the run."])
+        self.assertEqual(self.codes_of(text), {"secret:github-token": 1})
+        self.assertNotIn(TOKEN, (self.tmp / "runs.jsonl").read_text(encoding="utf-8"))
+
+    def test_R5_private_key_block_code(self):
+        text = self.with_note(["Deploy key:", KEY_BEGIN] + key_body() + [KEY_END])
+        self.assertEqual(self.codes_of(text), {"secret:private-key-block": 1})
+
+    def test_R5_item_code_names_section(self):
+        item = "- the retry design is still open and nothing here says why or how to start it at all"
+        text = set_section(self.base, "What Has NOT Been Tried Yet", item)
+        self.assertEqual(self.codes_of(text), {"item-incomplete:what-has-not-been-tried-yet": 1})
+        text = set_section(self.base, "Decisions Made", item)
+        self.assertIn("item-incomplete:decisions-made", self.codes_of(text))
+
+    def test_R5_decisions_table_code(self):
+        text = set_section(self.base, "Decisions Made", decisions_table([("a", "", "c")]))
+        self.assertEqual(self.codes_of(text), {"decisions-table": 1})
+
+    def test_R5_contract_codes(self):
+        no_toplevel = self.base.replace("**Toplevel:** /home/u/sample-project\n", "")
+        self.assertEqual(self.codes_of(no_toplevel), {"contract-toplevel": 1})
+        next_step = set_section(self.base, "Exact Next Step", "[next step]")
+        self.assertEqual(self.codes_of(next_step), {"contract-next-step": 1})
+        no_state = without_section(self.base, "Session State")
+        self.assertEqual(self.codes_of(no_state, args=("--git", "yes")), {"contract-session-state": 1})
+        no_key = set_section(self.base, "Goal (carried)", goal_section(omit=("Constraints",)))
+        self.assertEqual(self.codes_of(no_key), {"contract-goal-missing": 1})
+        no_goal = without_section(self.base, "Goal (carried)")
+        self.assertEqual(self.codes_of(no_goal), {"contract-goal-missing": 1})
+        prev = self.write(PREVIOUS.read_text(encoding="utf-8"), "previous.md")
+        cur = self.base.replace("**Continues:** none", f"**Continues:** {prev}")
+        drift = set_section(cur, "Goal (carried)", goal_section(goal='A different goal. User: "new"'))
+        self.assertEqual(self.codes_of(drift), {"contract-goal-drift": 1})
+
+    def test_R5_chain_codes(self):
+        gone = self.tmp / "no-such-handoff.md"
+        text = self.base.replace("**Continues:** none", f"**Continues:** {gone}")
+        self.assertEqual(self.codes_of(text), {"contract-continues": 1})
+        hist = self.tmp / "history.md"
+        hist.write_text("no keys here\n", encoding="utf-8")
+        closed = self.base.replace("\n## Exact Next Step", f"\n## Closed (pointers)\n\n- 1 items closed → {hist} (keys: zz)\n\n---\n\n## Exact Next Step", 1)
+        self.assertEqual(self.codes_of(closed), {"contract-closed": 1})
+
+    def test_R5_live_chain_code(self):
+        prev = PREVIOUS.read_text(encoding="utf-8")
+        prev = set_section(prev, "Session State", state_section(subagents=live_item("lost-one", item_id="zz9")))
+        path = self.write(prev, "previous.md")
+        cur = self.base.replace("**Continues:** none", f"**Continues:** {path}")
+        self.assertEqual(self.codes_of(cur), {"contract-live-chain": 1})
+
+    def test_R5_codes_are_in_vocabulary(self):
+        mod = load_checker()
+        token_note = self.with_note([f"Use {TOKEN} and {SECRETS[5][1]} here.", KEY_BEGIN] + key_body() + [KEY_END])
+        inputs = [
+            token_note,
+            self.base.replace("**Toplevel:** /home/u/sample-project\n", ""),
+            set_section(self.base, "Exact Next Step", "[next step]"),
+            set_section(self.base, "Decisions Made", decisions_table([("a", "", "c")])),
+            set_section(self.base, "What Has NOT Been Tried Yet", "- " + "word " * 12),
+            without_section(self.base, "Session State"),
+            TEMPLATE.read_text(encoding="utf-8"),
+        ]
+        seen = set()
+        for n, text in enumerate(inputs):
+            with self.subTest(n=n):
+                codes = self.codes_of(text, args=("--git", "yes"))
+                self.assertTrue(codes, "expected at least one code")
+                for code in codes:
+                    self.assertIn(code, mod.FAIL_CODES)
+                seen.update(codes)
+        self.assertTrue({"secret:github-token", "secret:aws-access-key", "secret:private-key-block"} <= seen, seen)
+        for code in mod.FAIL_CODES:
+            self.assertRegex(code, r"^[a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)?$")
+
+    def test_R5_exit2_codes(self):
+        proc = subprocess.run([sys.executable, str(CHECKER)], capture_output=True, text=True,
+                              encoding="utf-8", env=self.env())
+        self.assertEqual(proc.returncode, 2)
+        rec = self.record()
+        self.assertEqual((rec["fail_codes"], rec["handoff_bytes"]), ({"usage": 1}, None))
+        proc = subprocess.run([sys.executable, str(CHECKER), str(self.tmp / "nope.md")], capture_output=True,
+                              text=True, encoding="utf-8", env=self.env())
+        self.assertEqual(proc.returncode, 2)
+        rec = self.record()
+        self.assertEqual((rec["fail_codes"], rec["handoff_bytes"]), ({"unreadable": 1}, None))
+
+    def test_R5_run_resets_RUN(self):
+        good = self.write(self.base, "good.md")
+        mod = load_checker()
+        env = {"HOME": str(self.home), "USERPROFILE": str(self.home), "HANDOFF_LOG": str(self.tmp / "runs.jsonl")}
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mod.run([]), 2)  # usage: leaves RUN["fail"] behind
+            self.assertEqual(mod.run([str(good), "--git", "yes"]), 0)  # leaves RUN["size"] behind
+            self.assertEqual(mod.run([str(self.tmp / "nope.md")]), 2)
+        usage, valid, unreadable = [json.loads(x) for x in self.records()]
+        self.assertEqual(usage["fail_codes"], {"usage": 1})
+        self.assertEqual(valid["fail_codes"], {})
+        self.assertEqual(valid["handoff_bytes"], len(self.base.encode("utf-8")))
+        self.assertEqual(unreadable["fail_codes"], {"unreadable": 1})
+        self.assertIsNone(unreadable["handoff_bytes"])
+
+    def test_R5_log_failure_keeps_exit_code(self):
+        bad = self.write(TEMPLATE.read_text(encoding="utf-8"), "bad.md")
+        good = self.write(self.base, "good.md")
+        for name in ("count_fail_codes", "project_of"):  # the helpers log_run alone uses
+            for path, want in ((good, 0), (bad, 1)):
+                with self.subTest(helper=name, want=want):
+                    mod = load_checker()
+                    env = {"HOME": str(self.home), "USERPROFILE": str(self.home),
+                           "HANDOFF_LOG": str(self.tmp / "runs.jsonl")}
+                    out, err = io.StringIO(), io.StringIO()
+                    with mock.patch.dict(os.environ, env), mock.patch.object(mod, name, side_effect=RuntimeError("boom")), \
+                            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        code = mod.run([str(path), "--git", "yes"])
+                    self.assertEqual(code, want, out.getvalue() + err.getvalue())
+                    self.assertEqual(err.getvalue().count("WARNING: run log not written:"), 1, err.getvalue())
+                    self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
+        self.assertEqual(self.records(), [])
+
+    def test_R5_fail_overrides_parts(self):
+        bad = self.write(TEMPLATE.read_text(encoding="utf-8"), "bad.md")
+        mod = load_checker()
+        env = {"HOME": str(self.home), "USERPROFILE": str(self.home), "HANDOFF_LOG": str(self.tmp / "runs.jsonl")}
+        # main() fills RUN["parts"] first, then raises at the size check
+        with mock.patch.dict(os.environ, env), mock.patch.object(mod, "SIZE_LIMIT_KIB", None), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = mod.run([str(bad), "--git", "yes"])
+        self.assertEqual(code, 2)
+        self.assertEqual(tail_record(self.tmp / "runs.jsonl")["fail_codes"], {"internal": 1})
+
+    def test_R5_unresolvable_home_exit2(self):
+        code, out, err, _ = self.call_run(["~nosuchuser_zz/x.md", "--git", "yes"])
+        self.assertEqual(code, 2)  # the one documented exception: before, an uncaught exit 1 with a traceback
+        self.assertTrue(err.rstrip("\n").splitlines()[-1].startswith("WARNING: run log not written:"), err)
+        self.assertEqual(self.records(), [])
+
+
+class PartsInputs:
+    def lines_of(self):
+        gh, aws, slack = SECRETS[0][1], SECRETS[5][1], SECRETS[4][1]
+        return [
+            ["plain", f"a {slack} b", "x", f"{gh} and {aws}", "y"],
+            [KEY_BEGIN] + key_body() + [KEY_END, f"after {gh}"],
+            [f"early {aws}", "mid", KEY_BEGIN, *key_body(), KEY_END, f"late {SECRETS[3][1]}", f"EXAMPLE {gh}"],
+            [],
+            ["nothing secret here"],
+        ]
+
+    def contract_texts(self):
+        prev = self.write(PREVIOUS.read_text(encoding="utf-8"), "previous.md")
+        return [
+            self.base, TEMPLATE.read_text(encoding="utf-8"), PREVIOUS.read_text(encoding="utf-8"),
+            without_section(self.base, "Session State"), set_section(self.base, "Exact Next Step", "[x]"),
+            self.base.replace("**Continues:** none", f"**Continues:** {prev}"),
+            set_section(self.base.replace("**Continues:** none", f"**Continues:** {prev}"),
+                        "Goal (carried)", goal_section(goal='drift. User: "x"')),
+            without_section(self.base, "Goal (carried)"),
+        ]
+
+
+class SecretPartsTest(PartsInputs, SignalCase):
+    def test_R5_secret_parts_in_line_order(self):
+        mod = load_checker()
+        lines = self.lines_of()[2]
+        self.assertEqual([kind for kind, _ in mod.secret_parts(lines)],
+                         ["AWS access key", "private key block", "sk- API key"])
+        same_line = self.lines_of()[0]
+        self.assertEqual([kind for kind, _ in mod.secret_parts(same_line)],
+                         ["Slack token", "GitHub token", "AWS access key"])
+
+    def test_R5_parts_flatten_to_failures(self):
+        mod = load_checker()
+        for n, text in enumerate(self.contract_texts()):
+            for git in (None, True, False):
+                with self.subTest(n=n, git=git):
+                    lines = text.split("\n")
+                    parts = mod.resume_contract_parts(lines, git, VALID)
+                    self.assertEqual(mod.resume_contract_failures(lines, git, VALID),
+                                     [m for _, msgs in parts for m in msgs])
+                    missing, drift = mod.goal_parts(lines)
+                    self.assertEqual(mod.goal_failures(lines), missing + drift)
+
+
+class SecretPartsBaseTest(PartsInputs, SignalCase):
+    """The same functions against the base commit; skipped as a class when it is not available."""
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.old = base_checker_module(cls)
+
+    def test_R5_secret_parts_flatten_equals_old(self):
+        mod = load_checker()
+        for n, lines in enumerate(self.lines_of()):
+            with self.subTest(n=n):
+                self.assertEqual(mod.secret_failures(lines), self.old.secret_failures(lines))
+                self.assertEqual([msg for _, msg in mod.secret_parts(lines)], self.old.secret_failures(lines))
+
+    def test_R5_parts_flatten_equals_old(self):
+        mod = load_checker()
+        for n, text in enumerate(self.contract_texts()):
+            for git in (None, True, False):
+                with self.subTest(n=n, git=git):
+                    lines = text.split("\n")
+                    self.assertEqual(self.old.resume_contract_failures(lines, git, VALID),
+                                     mod.resume_contract_failures(lines, git, VALID))
+                    self.assertEqual(self.old.goal_failures(lines), mod.goal_failures(lines))
+
+
+class ProjectBytesTest(SignalCase):
+    def test_R6_project_from_existing_toplevel(self):
+        real = self.tmp / "proj"
+        real.mkdir()
+        for value, want in ((str(real), str(real)), (str(self.tmp / "nowhere"), None), ("sample-project", None),
+                            (str(self.tmp / "h.md"), None), (".", None)):  # `.` is a folder in every cwd
+            with self.subTest(value=value):
+                (self.tmp / "h.md").write_text("file", encoding="utf-8")
+                text = self.base.replace("**Toplevel:** /home/u/sample-project", f"**Toplevel:** {value}")
+                self.run_text(text)
+                self.assertEqual(self.record()["project"], want)
+
+    def test_R6_handoff_bytes(self):
+        text = self.base.replace("sample-project", "샘플-project")
+        self.run_text(text, name="h.md")
+        self.assertEqual(self.record()["handoff_bytes"], len((self.tmp / "h.md").read_bytes()))
+        self.assertNotEqual(len(text), len(text.encode("utf-8")))
+        subprocess.run([sys.executable, str(CHECKER), str(self.tmp / "gone.md")], capture_output=True, env=self.env())
+        self.assertIsNone(self.record()["handoff_bytes"])
+
+    def test_R6_unstatable_toplevel_gives_null_project(self):
+        value = "/" + "a" * 256  # one name over NAME_MAX: is_dir() raises ENAMETOOLONG instead of returning False
+        proc = self.run_text(self.base.replace("**Toplevel:** /home/u/sample-project", f"**Toplevel:** {value}"))
+        self.assertEqual(len(self.records()), 1, proc.stderr)
+        self.assertIsNone(self.record()["project"])
+
+    def test_R6_no_indented_text_in_record(self):
+        item = f"- {BODY_SENTINEL} " + "word " * 12
+        texts = [
+            set_section(self.base, "What Has NOT Been Tried Yet", item),
+            set_section(self.base, "Goal (carried)", goal_section(origin=f"{BODY_SENTINEL}/not-absolute")),
+            self.with_state(subagents=live_item(BODY_SENTINEL, omit=("does",))),
+            self.base.replace("**Continues:** none", f"**Continues:** /no/such/{BODY_SENTINEL}"),
+        ]
+        for n, text in enumerate(texts):
+            with self.subTest(n=n):
+                proc = self.run_text(text, args=("--git", "yes"))
+                self.assertIn(BODY_SENTINEL, proc.stdout)  # the run did print it
+                self.assertEqual(self.record()["exit"], 1)
+                self.assertNotIn(BODY_SENTINEL, json.dumps(self.record()))
+
+    def test_R6_line_separator_stays_inside_its_line(self):
+        sentinel = "body" + "sentinel" + "-2028"
+        text = self.base.replace("**Toplevel:** /home/u/sample-project",
+                                 f"**Toplevel:** relative\u2028WARNING: {sentinel} leaked")
+        proc = self.run_text(text)
+        self.assertIn(sentinel, proc.stdout)  # inside the indented Toplevel message
+        self.assertNotIn(sentinel, json.dumps(self.record()))
+
+    def test_R6_tee_splits_on_newline_only(self):
+        tee = load_checker()._Tee(io.StringIO())
+        self.assertEqual(tee.lines(), [])
+        tee.write("  a\u2028b\x85c\x0bd\x0ce\x1cf\x1dg\x1eh\n")
+        tee.write("next")
+        self.assertEqual(tee.lines(), ["  a\u2028b\x85c\x0bd\x0ce\x1cf\x1dg\x1eh", "next"])
+
+
+def base_checker_module(cls):
+    """The base-commit scripts/check_handoff.py and run_log.py extracted to a temp folder; the module of the former."""
+    tmp = tempfile.TemporaryDirectory()
+    cls.addClassCleanup(tmp.cleanup)
+    for name in ("check_handoff.py", "run_log.py"):
+        proc = subprocess.run(["git", "show", f"{BASE_COMMIT}:scripts/{name}"], cwd=ROOT, capture_output=True)
+        if proc.returncode != 0:
+            raise unittest.SkipTest(f"base commit {BASE_COMMIT[:7]} is not available: {proc.stderr.decode()[:80]}")
+        (Path(tmp.name) / name).write_bytes(proc.stdout)
+    cls.base_dir = Path(tmp.name)
+    spec = importlib.util.spec_from_file_location("check_handoff_base", cls.base_dir / "check_handoff.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class BaseStdoutTest(SignalCase):
+    # 이 WU의 회귀 고정. checker 문구를 의도적으로 바꾸는 WU에서 기준 커밋을 갱신한다
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        base_checker_module(cls)
+
+    def both(self, argv):
+        env = self.env(HANDOFF_LOG="off")
+        old = subprocess.run([sys.executable, str(self.base_dir / "check_handoff.py"), *argv],
+                             capture_output=True, text=True, encoding="utf-8", env=env)
+        new = subprocess.run([sys.executable, str(CHECKER), *argv],
+                             capture_output=True, text=True, encoding="utf-8", env=env)
+        return old, new
+
+    def test_R5_stdout_matches_base_checker(self):
+        prev = self.write(PREVIOUS.read_text(encoding="utf-8"), "previous.md")
+        chain = self.base.replace("**Continues:** none", f"**Continues:** {prev}")
+        lost = self.write(set_section(PREVIOUS.read_text(encoding="utf-8"), "Session State",
+                                      state_section(subagents=live_item("lost-one", item_id="zz9"))), "lost.md")
+        hist = self.tmp / "history.md"
+        hist.write_text("no keys here\n", encoding="utf-8")
+        cases = {
+            "secret": (set_section(self.base, "Environment & Setup Notes", f"Use {TOKEN} and {SECRETS[5][1]}", sep=False),
+                       ["--git", "yes"]),
+            "decisions": (set_section(self.base, "Decisions Made", decisions_table([("a", "", "c")])), ["--git", "yes"]),
+            "goal-drift": (set_section(chain, "Goal (carried)", goal_section(goal='drift. User: "x"')), ["--git", "yes"]),
+            "live-chain": (self.base.replace("**Continues:** none", f"**Continues:** {lost}"), ["--git", "yes"]),
+            "closed": (self.base.replace("\n## Exact Next Step",
+                                         f"\n## Closed (pointers)\n\n- 1 items closed → {hist} (keys: zz)\n\n---\n\n## Exact Next Step", 1),
+                       ["--git", "yes"]),
+            "no-session-state": (without_section(self.base, "Session State"), ["--git", "yes"]),
+        }
+        for name, (text, flags) in cases.items():
+            with self.subTest(case=name):
+                path = self.write(text, f"{name}.md")
+                old, new = self.both([str(path), *flags])
+                self.assertEqual(old.returncode, 1, old.stdout)
+                self.assertEqual((new.returncode, new.stdout), (old.returncode, old.stdout))
+        with self.subTest(case="usage"):
+            old, new = self.both([])
+            self.assertEqual(old.returncode, 2)
+            self.assertEqual((new.returncode, new.stdout), (old.returncode, old.stdout))
+        with self.subTest(case="unreadable"):
+            old, new = self.both([str(self.tmp / "nope.md")])
+            self.assertEqual(old.returncode, 2)
+            self.assertEqual((new.returncode, new.stdout), (old.returncode, old.stdout))
 
 
 if __name__ == "__main__":

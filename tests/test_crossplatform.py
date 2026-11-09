@@ -17,6 +17,7 @@ SCRIPTS = {
     "check_handoff.py": ROOT / "scripts" / "check_handoff.py",
     "handoff_state.py": ROOT / "scripts" / "handoff_state.py",
     "run_log.py": ROOT / "scripts" / "run_log.py",
+    "run_report.py": ROOT / "scripts" / "run_report.py",
     "install.py": ROOT / "install.py",
 }
 SUBPROCESS_FUNCS = {"run", "Popen", "call", "check_call", "check_output"}
@@ -152,6 +153,9 @@ class CrossPlatformTest(unittest.TestCase):
 
     def test_A7_run_log_conditions(self):
         self.check("run_log.py")
+
+    def test_A7_run_report_conditions(self):
+        self.check("run_report.py")
 
     def test_A7_install_conditions(self):
         self.check("install.py")

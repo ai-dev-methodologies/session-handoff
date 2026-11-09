@@ -26,7 +26,7 @@ This repository passes what one session knew to the next session without a break
 flowchart TD
     subgraph REPO["This repository (canonical)"]
         C["commands/<br/>handoff.md · resume-handoff.md"]
-        S["scripts/<br/>handoff_state.py · check_handoff.py · run_log.py"]
+        S["scripts/<br/>handoff_state.py · check_handoff.py · run_log.py · run_report.py"]
         I["install.py"]
     end
     subgraph HOME["~/.claude (installed copy)"]
@@ -85,7 +85,8 @@ Solid lines are the main flow of install, run, write, and resume. Dotted lines a
 | `scripts/handoff_state.py` | Run once in Step 0 of both commands. Common output: a git state summary, the rules file paths, and the status file path. `/handoff` also prints the previous handoff and history file paths. `--resume` also prints the chosen handoff, the `continue:` line, subagent states, and the check result | `~/.claude/scripts/` |
 | `scripts/check_handoff.py` | Checks that a handoff file follows the format. `/handoff` Step 6 and `handoff_state.py` call it | `~/.claude/scripts/` |
 | `scripts/run_log.py` | Writes one line per run of the two scripts to `runs.jsonl` | `~/.claude/scripts/` |
-| `install.py` | Installs the five files above. Existing files that would change are backed up first. It exists only in this repository | Not installed |
+| `scripts/run_report.py` | Summarizes `runs.jsonl` in one command, read-only. Run it only when you want to know what happened | `~/.claude/scripts/` |
+| `install.py` | Installs the six files above. Existing files that would change are backed up first. It exists only in this repository | Not installed |
 | `tests/` | Tests that pin the behavior of the files above | Not installed |
 | `docs/field-map.md` | A record of where each field of the old format went in the new format | Not installed |
 
@@ -211,6 +212,34 @@ The original goal and purpose, and the context still in progress, are kept acros
 - To check a result, look at this file and at the handoff file path written in it.
 - When the file exceeds 5 MB, it is renamed to `runs.jsonl.1` and a new file starts.
 
+### Run Report
+`run_report.py` reads the run log (and `runs.jsonl.1` when it exists) and prints what happened and what to fix. It never writes the log. It never prints the `stdout` or `args` of a record. Do not paste report output into a public repository, because it holds local paths and session ids.
+
+Every line has 19 keys. These five are the newest. A key without a value is `null`. Lines written by an older version lack them, and the report counts those lines under Coverage.
+
+| Key | Contents |
+|---|---|
+| `session_id` | The value of `CLAUDE_CODE_SESSION_ID` when it is a UUID (8-4-4-4-12 hex digits); otherwise `null` |
+| `caller` | `handoff_state.py` when that script ran the checker, set through `HANDOFF_CALLER`. Otherwise `null` |
+| `project` | The project key. For a check run, the `**Toplevel:**` of the checked file when it is an existing absolute folder |
+| `fail_codes` | `check_handoff.py` only. An object of fixed failure codes with counts, `{}` on a pass, `null` for `handoff_state.py` |
+| `handoff_bytes` | `check_handoff.py` only. The UTF-8 byte count of the checked text after newline normalization to LF (the same basis as the checker's `WARNING: handoff file is <N> KiB` line) |
+
+```
+python3 ~/.claude/scripts/run_report.py [--log PATH] [--since DATE] [--project PATH] [--version V] [--json]
+```
+
+| Option | Meaning |
+|---|---|
+| `--log PATH` | The log to read. The default is the run log path, and `HANDOFF_LOG` is respected |
+| `--since DATE` | Only records at or after the date. Form: `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SSZ` |
+| `--project PATH` | Only records of that project |
+| `--version V` | Only records of that version. `V` also matches `V-<n>` and `V.<n>` |
+| `--json` | The same content as JSON with fixed keys |
+
+- Exit code 0: the report was printed, including when the log is missing or empty.
+- Exit code 2: a usage error (for example a bad `--since` value, or `HANDOFF_LOG=off` without `--log`), a log path that cannot be read, or an internal error (one stderr line, no traceback).
+
 ## Exit Codes
 These are the exit codes of `handoff_state.py`.
 
@@ -235,6 +264,8 @@ These are the exit codes of `check_handoff.py`.
 |---|---|
 | `HANDOFF_LOG` | The path of the run log file. If the value is `off`, nothing is logged |
 | `HANDOFF_CHECKER` | The path of the checker that `handoff_state.py` calls. If unset, it uses `check_handoff.py` in the same folder as `handoff_state.py` |
+| `CLAUDE_CODE_SESSION_ID` | Set by Claude Code. The run log records it as `session_id` when it is a UUID (8-4-4-4-12 hex digits), otherwise `null`. No other variable is recorded |
+| `HANDOFF_CALLER` | Set by `handoff_state.py` for the checker it runs. The run log records it as `caller` only when the value is `handoff_state.py` |
 
 If `~/.claude/scripts/context_budget.py` exists, `handoff_state.py` loads it and prints a `context-budget:` line. If it does not exist, no line is printed. This file is not in this repository, and `install.py` does not touch it.
 

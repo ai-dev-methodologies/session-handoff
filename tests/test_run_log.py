@@ -22,6 +22,7 @@ TS_FORMAT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 FIELDS = {
     "ts", "script", "version", "mode", "cwd", "toplevel", "args", "exit",
     "stdout", "omitted_lines", "warnings", "handoff", "continue", "checker",
+    "session_id", "caller", "project", "fail_codes", "handoff_bytes",
 }
 
 
@@ -46,6 +47,8 @@ class RunLogTestCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop("HANDOFF_LOG", None)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        os.environ.pop("HANDOFF_CALLER", None)
         self.default_log = self.home / ".claude" / "handoffs" / ".state" / "runs.jsonl"
 
     def lines(self, path):
@@ -75,8 +78,9 @@ class BuildRecordTest(RunLogTestCase):
         record = sample_record(
             handoff="/h/a.md", cont="yes", checker=0,
         )
+        # ts, version, session_id and caller are filled by append_run, not build_record
         self.assertEqual(
-            set(record) - {"ts", "version"}, FIELDS - {"ts", "version"},
+            set(record), FIELDS - {"ts", "version", "session_id", "caller"},
         )
         self.assertEqual(record["script"], "handoff_state.py")
         self.assertEqual(record["mode"], "resume")
@@ -225,6 +229,114 @@ class AppendRunTest(RunLogTestCase):
         result = run_log.append_run(record)
         self.assertIsInstance(result, str)
         self.assertTrue(result)
+
+
+class SignalFieldsTest(RunLogTestCase):
+    SESSION = "0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"
+
+    def written(self, record=None):
+        self.assertIsNone(run_log.append_run(record or sample_record()))
+        return json.loads(self.lines(self.default_log)[-1])
+
+    def test_R1_session_id_from_env(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = self.SESSION
+        self.assertEqual(self.written()["session_id"], self.SESSION)
+
+    def test_R1_session_id_absent_is_null(self):
+        self.assertIsNone(self.written()["session_id"])
+
+    def test_R1_session_id_invalid_is_null(self):
+        for bad in ("", " ", "has space-0001", "a/b-0001-xxxx", "star*-0001-xx", "-leading-0001",
+                    "short", "a" * 129, "abcdefgh1\n", "a" * 8, "a" * 128, self.SESSION + "\n", " " + self.SESSION):
+            with self.subTest(value=bad):
+                os.environ["CLAUDE_CODE_SESSION_ID"] = bad
+                self.assertIsNone(self.written()["session_id"])
+
+    def test_R1_session_id_token_shape_is_null(self):
+        token = "gh" + "p_" + "Ab3" * 12  # built here, so no complete token sits in any file
+        os.environ["CLAUDE_CODE_SESSION_ID"] = token
+        self.assertIsNone(self.written()["session_id"])
+        self.assertNotIn(token, self.default_log.read_text(encoding="utf-8"))
+
+    def test_R1_session_id_non_uuid_is_null(self):
+        for bad in ("sess-abcdef12", "session-one", self.SESSION.replace("-", ""), self.SESSION[:-1] + "g",
+                    self.SESSION + "0", "{" + self.SESSION + "}", self.SESSION.replace("-", "_")):
+            with self.subTest(value=bad):
+                os.environ["CLAUDE_CODE_SESSION_ID"] = bad
+                self.assertIsNone(self.written()["session_id"])
+
+    def test_R1_session_id_uuid_shape_is_accepted(self):
+        for ok in (self.SESSION, self.SESSION.upper(), "00000000-0000-0000-0000-000000000000"):
+            with self.subTest(value=ok):
+                os.environ["CLAUDE_CODE_SESSION_ID"] = ok
+                self.assertEqual(self.written()["session_id"], ok)
+
+    def test_R1_other_env_never_recorded(self):
+        sentinel = "tok" + "sentinel" + "-4417"
+        os.environ["CLAUDE_CODE_MESSAGING_TOKEN"] = sentinel
+        os.environ["CLAUDE_CODE_SESSION_ID"] = self.SESSION
+        os.environ["HANDOFF_CALLER"] = "handoff_state.py"
+        self.written()
+        self.assertNotIn(sentinel, self.default_log.read_text(encoding="utf-8"))
+
+    def test_R2_caller_whitelist(self):
+        check = lambda: sample_record(script="check_handoff.py", mode="check")
+        os.environ["HANDOFF_CALLER"] = "handoff_state.py"
+        self.assertEqual(self.written(check())["caller"], "handoff_state.py")
+        for other in ("", "other.py", "handoff_state.py ", "../handoff_state.py"):
+            with self.subTest(value=other):
+                os.environ["HANDOFF_CALLER"] = other
+                self.assertIsNone(self.written(check())["caller"])
+        del os.environ["HANDOFF_CALLER"]
+        self.assertIsNone(self.written(check())["caller"])
+
+    def test_R2_caller_only_on_checker_records(self):
+        os.environ["HANDOFF_CALLER"] = "handoff_state.py"
+        for script in ("handoff_state.py", "run_report.py", "check_handoff.py ", None):
+            with self.subTest(script=script):
+                self.assertIsNone(self.written(sample_record(script=script))["caller"])
+
+    def test_R2_record_cannot_inject_env_derived_fields(self):
+        record = sample_record()
+        record["session_id"] = self.SESSION
+        record["caller"] = "handoff_state.py"
+        written = self.written(record)
+        self.assertIsNone(written["session_id"])
+        self.assertIsNone(written["caller"])
+
+    def test_R2_environ_is_not_iterated(self):
+        class Guard(dict):
+            def __iter__(self):
+                raise AssertionError("os.environ was iterated")
+            items = keys = values = __iter__
+
+        guard = Guard(os.environ)
+        with mock.patch.object(os, "environ", guard):
+            self.assertIsNone(run_log.append_run(sample_record()))
+
+    def test_R3_new_fields_default_null(self):
+        record = sample_record()
+        for key in ("project", "fail_codes", "handoff_bytes"):
+            self.assertIn(key, record)
+            self.assertIsNone(record[key])
+
+    def test_R3_new_fields_pass_through(self):
+        record = sample_record(project="/work/proj", fail_codes={"secret:github-token": 2, "usage": 1},
+                               handoff_bytes=123)
+        self.assertEqual(record["project"], "/work/proj")
+        self.assertEqual(record["fail_codes"], {"secret:github-token": 2, "usage": 1})
+        self.assertEqual(record["handoff_bytes"], 123)
+        written = self.written(record)
+        self.assertEqual(written["project"], "/work/proj")
+        self.assertEqual(written["fail_codes"], {"secret:github-token": 2, "usage": 1})
+        self.assertEqual(written["handoff_bytes"], 123)
+
+    def test_R3_empty_fail_codes_is_kept_as_object(self):
+        self.assertEqual(self.written(sample_record(fail_codes={}))["fail_codes"], {})
+
+    def test_R4_version_format(self):
+        self.assertRegex(run_log.VERSION, r"^\d{4}\.\d{2}\.\d{2}-\d+$")
+        self.assertNotEqual(run_log.VERSION, "2026.11.09-1")
 
 
 if __name__ == "__main__":

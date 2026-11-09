@@ -119,6 +119,21 @@ DRIVE_RE = re.compile(r"^(?:/mnt)?/([A-Za-z])(?=/|$)")  # /c/... and /mnt/c/... 
 JOBS_PART = "/.claude/jobs/"
 
 
+def code_slug(text: str) -> str:
+    """Lower-case `text` with every run of non-alphanumerics as one `-`, no `-` at either end."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+FAIL_CODES = (  # the closed vocabulary of the run log's fail_codes: constants only, never message text
+    ("decisions-table", "contract-toplevel", "contract-continues", "contract-closed", "contract-live-chain",
+     "contract-goal-missing", "contract-goal-drift", "contract-session-state", "contract-next-step",
+     "usage", "unreadable", "internal", "secret:other")
+    + tuple(f"secret:{code_slug(label)}" for label, _ in SECRET_PATTERNS) + (f"secret:{code_slug(KEY_KIND)}",)
+    + tuple(f"item-incomplete:{code_slug(title)}" for title in SECTIONS)
+)
+RUN: dict = {}  # what main() hands to log_run: lines, parts, size, fail; reset at the start of run()
+
+
 def is_placeholder(text: str) -> bool:
     """True when `text` is an unfilled template value. `none` is a real value, not a placeholder."""
     s = text.strip()
@@ -180,17 +195,27 @@ def redact(text: str) -> str:
     return text
 
 
-def secret_failures(lines: "list[str]") -> "list[str]":
-    """One message per private key block, and per line and kind of token outside a block; a token line
-    holding EXAMPLE is skipped. In line order. No value is kept."""
+def secret_parts(lines: "list[str]") -> "list[tuple[str, str]]":
+    """(kind label, message) per private key block, and per line and kind of token outside a block; a token
+    line holding EXAMPLE is skipped. In line order. No value is kept."""
     blocks = key_blocks(lines)
     inside = {i for first, last in blocks for i in range(first, last + 1)}
-    found = [(first, f"secret-like value ({KEY_KIND}) on lines {first + 1}-{last + 1}; "
-                     f"replace the whole block with {REDACTED}") for first, last in blocks]
-    found += [(n, f"secret-like value ({kind}) on line {n + 1}; replace it with {REDACTED}")
+    found = [(first, KEY_KIND, f"secret-like value ({KEY_KIND}) on lines {first + 1}-{last + 1}; "
+                               f"replace the whole block with {REDACTED}") for first, last in blocks]
+    found += [(n, kind, f"secret-like value ({kind}) on line {n + 1}; replace it with {REDACTED}")
               for n, line in enumerate(lines) if n not in inside and SECRET_SKIP_WORD not in line
               for kind, pattern in SECRET_PATTERNS if pattern.search(line)]
-    return [msg for _, msg in sorted(found, key=lambda f: f[0])]
+    return [(kind, msg) for _, kind, msg in sorted(found, key=lambda f: f[0])]
+
+
+def secret_failures(lines: "list[str]") -> "list[str]":
+    """The messages of secret_parts, in the same order."""
+    return [msg for _, msg in secret_parts(lines)]
+
+
+def secret_code(kind: str) -> str:
+    code = f"secret:{code_slug(kind)}"
+    return code if code in FAIL_CODES else "secret:other"
 
 
 def is_absolute_path(text: str) -> bool:
@@ -433,11 +458,11 @@ def change_entries(value: str) -> "list[str]":
     return [e for e in CHANGE_SPLIT_RE.split(value.strip()) if e.strip()]
 
 
-def goal_failures(lines: "list[str]") -> "list[str]":
-    """Goal (carried): five real values, and no silent drift from the previous handoff of the chain."""
+def goal_parts(lines: "list[str]") -> "tuple[list[str], list[str]]":
+    """Goal (carried) as (missing, drift): the five real values, then no silent drift from the previous handoff."""
     goal = goal_fields(lines)
     if goal is None:
-        return [f"{GOAL_SECTION} section is missing ({', '.join(GOAL_KEYS)})"]
+        return [f"{GOAL_SECTION} section is missing ({', '.join(GOAL_KEYS)})"], []
     problems = []
     for key in GOAL_KEYS:
         if key not in goal:
@@ -447,19 +472,19 @@ def goal_failures(lines: "list[str]") -> "list[str]":
     if not problems and not is_absolute_path(goal["Origin"]):
         problems.append(f"{GOAL_SECTION} Origin does not start with an absolute path: {goal['Origin'][:60]}")
     if problems:
-        return problems
+        return problems, []
     prev_path = continues_path(lines)
     prev_lines = read_lines(prev_path) if prev_path else None
     prev = goal_fields(prev_lines) if prev_lines else None
     if prev is None:
-        return []
+        return [], []
     # Only the keys the previous file carries are compared (an older file has no Constraints), and a
     # secret-like value masked as REDACTED on either side is not a change.
     goal = {k: redact(v) for k, v in goal.items()}
     prev = {k: redact(v) for k, v in prev.items() if k in GOAL_KEYS}
     before, now = change_entries(prev.get("Changes", "none")), change_entries(goal["Changes"])
     if len(now) < len(before):
-        return [f"{GOAL_SECTION} Changes lost {len(before) - len(now)} entr(ies) of the previous handoff; entries are never removed"]
+        return [], [f"{GOAL_SECTION} Changes lost {len(before) - len(now)} entr(ies) of the previous handoff; entries are never removed"]
     if now[:len(before)] != before:
         problems.append(f"{GOAL_SECTION} Changes rewrote an entry of {prev_path.name}; earlier entries are copied unchanged, new ones appended")
     added = now[len(before):]
@@ -472,11 +497,17 @@ def goal_failures(lines: "list[str]") -> "list[str]":
         if "Origin" in prev and goal["Origin"] != prev["Origin"]:
             problems.append(f"{GOAL_SECTION} Origin differs from {prev_path.name}; Origin is copied unchanged")
         unquoted = [e[:60] for e in added if not QUOTE_RE.search(e)]
-        return problems + [f"{GOAL_SECTION} Changes entry has no quoted user sentence: {e}" for e in unquoted]
+        return [], problems + [f"{GOAL_SECTION} Changes entry has no quoted user sentence: {e}" for e in unquoted]
     changed = [k for k in GOAL_SAME_KEYS if k in prev and goal[k] != prev[k]]
     if changed:
         problems.append(f"{GOAL_SECTION} changed without a Changes entry ({', '.join(changed)} differ from {prev_path.name})")
-    return problems
+    return [], problems
+
+
+def goal_failures(lines: "list[str]") -> "list[str]":
+    """Goal (carried): five real values, and no silent drift from the previous handoff of the chain."""
+    missing, drift = goal_parts(lines)
+    return missing + drift
 
 
 def live_keys(lines: "list[str]") -> "list[tuple[str, str]]":
@@ -549,10 +580,14 @@ def next_step_missing(lines: "list[str]") -> bool:
     return not real or (block[:1], block[-1:]) in (("[", "]"), ("<", ">"))
 
 
-def resume_contract_failures(lines: "list[str]", git: "bool | None" = None, path: "Path | None" = None) -> "list[str]":
-    """What /resume-handoff needs from the file itself. Empty list when satisfied."""
-    problems = (toplevel_failures(lines) + continues_failures(lines, path) + goal_failures(lines)
-                + closed_failures(lines) + live_chain_failures(lines))
+def resume_contract_parts(lines: "list[str]", git: "bool | None" = None,
+                          path: "Path | None" = None) -> "list[tuple[str, list[str]]]":
+    """The resume-contract checks as (code, messages), in the order resume_contract_failures lists them."""
+    goal_missing, goal_drift = goal_parts(lines)
+    parts = [("contract-toplevel", toplevel_failures(lines)), ("contract-continues", continues_failures(lines, path)),
+             ("contract-goal-missing", goal_missing), ("contract-goal-drift", goal_drift),
+             ("contract-closed", closed_failures(lines)), ("contract-live-chain", live_chain_failures(lines))]
+    problems = []
     state = section_body(lines, "Session State")
     if state is not None:
         problems.extend(session_state_failures(state, git))
@@ -560,9 +595,15 @@ def resume_contract_failures(lines: "list[str]", git: "bool | None" = None, path
         problems.append("Session State section is missing inside a git repository")
     elif git is False:
         problems.append("Session State section is missing: outside git it still carries the three Live fields")
+    parts.append(("contract-session-state", problems))
     if next_step_missing(lines):
-        problems.append("Exact Next Step is missing, empty, or only placeholders")
-    return problems
+        parts.append(("contract-next-step", ["Exact Next Step is missing, empty, or only placeholders"]))
+    return parts
+
+
+def resume_contract_failures(lines: "list[str]", git: "bool | None" = None, path: "Path | None" = None) -> "list[str]":
+    """What /resume-handoff needs from the file itself. Empty list when satisfied."""
+    return [msg for _, msgs in resume_contract_parts(lines, git, path) for msg in msgs]
 
 
 def split_cells(line: str) -> "list[str]":
@@ -642,16 +683,20 @@ def parse_argv(argv: "list[str]") -> "tuple[str, bool | None] | None":
 def main(argv: "list[str]") -> int:
     parsed = parse_argv(argv)
     if parsed is None:
+        RUN["fail"] = "usage"
         print(__doc__)
         return 2
     path, git = Path(parsed[0]).expanduser(), parsed[1]
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
+        RUN["fail"] = "unreadable"
         print(f"cannot read {path}: {exc}")
         return 2
-    secrets = secret_failures(text.split("\n"))
+    secret_pairs = secret_parts(text.split("\n"))
+    secrets = [msg for _, msg in secret_pairs]
     lines = redact(text).split("\n")  # no message below can print a value, whole or cut
+    RUN["lines"] = lines
     failures = []
     for title in SECTIONS:
         try:
@@ -666,7 +711,11 @@ def main(argv: "list[str]") -> int:
             if not passes(item):
                 failures.append((title, flat[:120]))
     decisions = decisions_failures(lines)
-    contract = resume_contract_failures(lines, git, path)
+    contract_pairs = resume_contract_parts(lines, git, path)
+    contract = [msg for _, msgs in contract_pairs for msg in msgs]
+    RUN["parts"] = ([(secret_code(kind), [msg]) for kind, msg in secret_pairs]
+                    + [(f"item-incomplete:{code_slug(title)}", [head]) for title, head in failures]
+                    + [("decisions-table", decisions)] + contract_pairs)
     if secrets:  # first: the resume excerpt keeps only the first lines of this output
         print(f"[FAIL] {len(secrets)} secret-like value(s):")
         for msg in secrets:
@@ -688,6 +737,7 @@ def main(argv: "list[str]") -> int:
         print("[PASS] open items carry what/why/how or a design path; Decisions table and resume contract satisfied; "
               "no secret-like values")
     size = len(text.encode("utf-8"))
+    RUN["size"] = size
     if size > SIZE_LIMIT_KIB * 1024:
         print(f"WARNING: handoff file is {-(-size // 1024)} KiB (over {SIZE_LIMIT_KIB} KiB)")
     return code
@@ -707,12 +757,43 @@ class _Tee:
         self.stream.flush()
 
     def lines(self) -> "list[str]":
-        return "".join(self.parts).splitlines()
+        """Split on "\\n" only: splitlines() would also split on U+2028 and the like inside an indented line."""
+        lines = "".join(self.parts).split("\n")
+        return lines[:-1] if lines[-1] == "" else lines
 
 
-def log_run(record_args: dict) -> None:
-    """Append one run record; a failure only prints a WARNING line on stderr."""
+def count_fail_codes(parts: "list[tuple[str, list[str]]]") -> "dict[str, int]":
+    """code -> number of messages, in the order the codes first appear; a code without messages is left out."""
+    counts: dict = {}
+    for code, messages in parts:
+        if messages:
+            counts[code] = counts.get(code, 0) + len(messages)
+    return counts
+
+
+def project_of(lines: "list[str] | None") -> "str | None":
+    """The head `**Toplevel:**` value when it is an absolute path to a directory that exists here, else None."""
+    value = head_value(lines, TOPLEVEL_RE) if lines else None
+    if not value or is_placeholder(value) or not is_absolute_path(value):
+        return None
     try:
+        return value if Path(value).expanduser().is_dir() else None
+    except OSError:  # EACCES, ENAMETOOLONG and the like: not a folder here
+        return None
+
+
+def log_run(argv: "list[str]", code: int, stdout_lines: "list[str]") -> None:
+    """Append one run record; a failure only prints a WARNING line on stderr. Every field is computed in the try."""
+    try:
+        parsed = parse_argv(argv)
+        fail = RUN.get("fail")
+        fail_codes = {fail: 1} if fail else count_fail_codes(RUN.get("parts", []))
+        record_args = dict(
+            script="check_handoff.py", mode="check", cwd=str(Path.cwd()), toplevel=None, args=argv,
+            exit_code=code, stdout_lines=stdout_lines,
+            handoff=str(Path(parsed[0]).expanduser()) if parsed else None,
+            project=project_of(RUN.get("lines")), fail_codes=fail_codes, handoff_bytes=RUN.get("size"),
+        )
         spec = importlib.util.spec_from_file_location("run_log", Path(__file__).with_name("run_log.py"))
         run_log = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(run_log)
@@ -725,6 +806,7 @@ def log_run(record_args: dict) -> None:
 
 def run(argv: "list[str]") -> int:
     """main() plus the run log; an unexpected exception prints its traceback tail and exits 2."""
+    RUN.clear()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     tee = _Tee(sys.stdout)
@@ -734,15 +816,11 @@ def run(argv: "list[str]") -> int:
     except Exception:
         tail = traceback.format_exc().rstrip("\n").splitlines()[-5:]
         sys.stderr.write(redact("\n".join(tail)) + "\n")
+        RUN["fail"] = "internal"
         code = 2
     finally:
         sys.stdout = tee.stream
-    parsed = parse_argv(argv)
-    log_run(dict(
-        script="check_handoff.py", mode="check", cwd=str(Path.cwd()), toplevel=None, args=argv,
-        exit_code=code, stdout_lines=tee.lines(),
-        handoff=str(Path(parsed[0]).expanduser()) if parsed else None,
-    ))
+    log_run(argv, code, tee.lines())
     return code
 
 

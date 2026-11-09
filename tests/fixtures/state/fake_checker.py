@@ -18,6 +18,9 @@ if mode == "crash1":  # an uncaught exception also exits 1, with no [FAIL] line
 if mode == "argv":
     print("[PASS] argv=" + " ".join(sys.argv[1:]))
     sys.exit(0)
+if mode == "env":  # report the caller marker the parent set on this subprocess
+    print("[PASS] caller=" + os.environ.get("HANDOFF_CALLER", "unset"))
+    sys.exit(0)
 if mode == "sizewarn":  # the size warning, unindented like the real checker prints it
     print("[PASS] all checks passed")
     print("WARNING: handoff file is 20 KiB (over 16 KiB)")

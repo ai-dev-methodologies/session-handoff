@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from io import StringIO
@@ -50,7 +50,8 @@ class StateTestCase(unittest.TestCase):
 
     # --- helpers -----------------------------------------------------------
     def env(self, **extra):
-        env = {k: v for k, v in os.environ.items() if k not in ("HANDOFF_CHECKER", "HANDOFF_LOG")}
+        env = {k: v for k, v in os.environ.items() if k not in (
+            "HANDOFF_CHECKER", "HANDOFF_LOG", "CLAUDE_CODE_SESSION_ID", "HANDOFF_CALLER")}
         env.update(HOME=str(self.home), USERPROFILE=str(self.home), PYTHONIOENCODING="utf-8",
                    HANDOFF_LOG=str(self.tmp / "runs.jsonl"))
         env.update(extra)
@@ -1233,10 +1234,179 @@ class RunLogTests(StateTestCase):
         self.assertEqual(len(self.lines_with(proc.stderr, "WARNING: run log not written:")), 1, proc.stderr)
         self.assertNotIn("run log", proc.stdout)
 
+    def test_M3_token_in_live_item_name_stays_out_of_the_log(self):
+        token = "gh" + "p_" + "Ab3" * 12  # built here, so no complete token sits in any file
+        item = "\n".join([f"  - name: worker-{token} (h7)", "    does: reviews the diff",
+                          "    decision: Use the sample approach", "    result: /home/u/out/review.md",
+                          "    done-when: the transcript ends with end_turn", "    after-return: fold the findings in"])
+        text = self.valid_handoff_text().replace("- **Live subagents:** none", "- **Live subagents:**\n" + item)
+        self.write_handoff("2026-11-01-work-session.tmp", text)
+        proc = self.run_state("--resume")
+        self.assertIn(f"live subagent: worker-{token} (h7)", proc.stdout, "the briefing is not redacted")
+        self.assertEqual(self.log.read_text(encoding="utf-8").count(token), 0)
+        (rec,) = [r for r in self.records() if r["mode"] == "resume"]
+        self.assertIn("live subagent: worker-REDACTED (h7) -> lost (no transcript)", rec["stdout"])
+
+    def test_M4_tee_splits_on_newline_only(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("handoff_state_tee", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        tee = mod._Tee(StringIO())
+        self.assertEqual(tee.lines(), [])
+        tee.write("  a\u2028b\x85c\x0bd\x0ce\x1cf\x1dg\x1eh\n")
+        tee.write("next")
+        self.assertEqual(tee.lines(), ["  a\u2028b\x85c\x0bd\x0ce\x1cf\x1dg\x1eh", "next"])
+
     def test_A12_off_writes_nothing(self):
         self.run_state(extra_env={"HANDOFF_LOG": "off"})
         self.assertFalse(self.log.exists())
         self.assertFalse((self.home / ".claude" / "handoffs" / ".state" / "runs.jsonl").exists())
+
+
+class BrokenCheckerRecordTests(StateTestCase):
+    """N2: a check_handoff.py that cannot be imported still leaves a record, with no stdout line in it."""
+    BASE_COMMIT = "c34a100e08ab4c4fc09f7ab3abaa31ae36281fad"
+
+    def sources(self):
+        """{label: {name: bytes}} of the base-commit and current handoff_state.py + run_log.py."""
+        out = {"base": {}, "new": {}}
+        for name in ("handoff_state.py", "run_log.py"):
+            out["new"][name] = (ROOT / "scripts" / name).read_bytes()
+            proc = subprocess.run(["git", "show", f"{self.BASE_COMMIT}:scripts/{name}"], cwd=ROOT, capture_output=True)
+            if proc.returncode != 0:
+                self.skipTest(f"base commit {self.BASE_COMMIT[:7]} is not available")
+            out["base"][name] = proc.stdout
+        return out
+
+    def test_N2_unloadable_checker_still_writes_an_empty_record(self):
+        token = "gh" + "p_" + "Ab3" * 12  # built here, so no complete token sits in any file
+        self.init_repo({"a.txt": "a\n"})
+        item = "\n".join([f"  - name: worker-{token} (h7)", "    does: reviews the diff",
+                          "    decision: Use the sample approach", "    result: /home/u/out/review.md",
+                          "    done-when: the transcript ends with end_turn", "    after-return: fold the findings in"])
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text().replace(
+            "- **Live subagents:** none", "- **Live subagents:**\n" + item))
+        sources = self.sources()
+        folder = self.tmp / "scripts"  # one folder for both versions: the checker's traceback names its path
+        folder.mkdir()
+        (folder / "check_handoff.py").write_text('raise ImportError("broken install")\n', encoding="utf-8")
+        for args in ((), ("--resume",)):
+            with self.subTest(args=args):
+                runs, logs = {}, {}
+                for label, files in sources.items():
+                    for name, data in files.items():
+                        (folder / name).write_bytes(data)
+                    logs[label] = self.tmp / f"{label}-{len(args)}.jsonl"
+                    runs[label] = subprocess.run(
+                        [sys.executable, str(folder / "handoff_state.py"), str(self.repo), *args],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        env=self.env(HANDOFF_LOG=str(logs[label])), cwd=str(self.tmp))
+                new, base = runs["new"], runs["base"]
+                self.assertEqual((new.returncode, new.stdout), (base.returncode, base.stdout))
+                self.assertIn("WARNING: placeholder check unavailable", new.stdout)
+                recs = [json.loads(ln) for ln in logs["new"].read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(recs), 1, new.stderr)
+                rec = recs[0]
+                self.assertEqual((rec["script"], rec["exit"]), ("handoff_state.py", new.returncode))
+                self.assertEqual((rec["stdout"], rec["warnings"], rec["omitted_lines"]), ([], [], 0))
+                self.assertEqual(logs["new"].read_text(encoding="utf-8").count(token), 0)
+                self.assertNotIn("run log not written", new.stderr)
+
+
+# --- R7: run log signals (project key, caller marker on the checker subprocess) ---------------
+class RunSignalTests(StateTestCase):
+    def setUp(self):
+        super().setUp()
+        self.init_repo({"a.txt": "a\n"})
+        self.log = self.tmp / "runs.jsonl"
+
+    def own_records(self):
+        recs = [json.loads(ln) for ln in self.log.read_text(encoding="utf-8").splitlines()]
+        return [r for r in recs if r["script"] == "handoff_state.py"]
+
+    def key_of(self, proc):
+        (line,) = self.lines_with(proc.stdout, "project key: ")
+        return line[len("project key: "):]
+
+    def test_R7_record_project_is_project_key(self):
+        wt = self.tmp / "wt"
+        self.git("worktree", "add", "-q", "-b", "feat", str(wt))
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        for label, cwd in (("git", self.repo), ("linked worktree", wt), ("outside git", plain)):
+            for args in ((), ("--resume",)):
+                with self.subTest(where=label, args=args):
+                    self.log.unlink(missing_ok=True)
+                    proc = self.run_state(*args, cwd=cwd)
+                    (rec,) = self.own_records()
+                    self.assertEqual(rec["project"], self.key_of(proc), proc.stdout)
+
+    def test_R7_checker_gets_caller_env(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        proc = self.run_state("--resume", extra_env={
+            "HANDOFF_CHECKER": str(FIXTURES / "fake_checker.py"), "FAKE_CHECKER_MODE": "env"})
+        self.assertIn("[PASS] caller=handoff_state.py", proc.stdout, self.combined(proc))
+
+    def test_R7_caller_marker_overrides_a_user_value_on_the_subprocess_only(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        proc = self.run_state("--resume", extra_env={
+            "HANDOFF_CHECKER": str(FIXTURES / "fake_checker.py"), "FAKE_CHECKER_MODE": "env",
+            "HANDOFF_CALLER": "something-else"})
+        self.assertIn("[PASS] caller=handoff_state.py", proc.stdout, self.combined(proc))
+        (rec,) = [r for r in self.own_records() if r["mode"] == "resume"]
+        self.assertIsNone(rec["caller"], "an unlisted value is never recorded")
+
+    def test_R7_marker_is_not_set_on_the_current_process(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("handoff_state_under_test", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        handoff = self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        env = {k: v for k, v in os.environ.items() if k != "HANDOFF_CALLER"}
+        env.update(HANDOFF_CHECKER=str(FIXTURES / "fake_checker.py"), FAKE_CHECKER_MODE="env")
+        with mock.patch.dict(os.environ, env, clear=True), redirect_stdout(StringIO()) as out:
+            mod.run_checker(handoff, False)
+            self.assertNotIn("HANDOFF_CALLER", os.environ)
+        self.assertIn("[PASS] caller=handoff_state.py", out.getvalue())
+
+    def test_R7_own_record_caller_null(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        self.run_state("--resume")
+        recs = self.own_records()
+        self.assertEqual([r["mode"] for r in recs], ["resume"])
+        self.assertTrue(all("caller" in r and r["caller"] is None for r in recs), recs)
+
+    def test_R7_real_checker_record_carries_the_caller(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        sid = "0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"
+        self.run_state("--resume", extra_env={"CLAUDE_CODE_SESSION_ID": sid})
+        recs = [json.loads(ln) for ln in self.log.read_text(encoding="utf-8").splitlines()]
+        check = [r for r in recs if r["script"] == "check_handoff.py"]
+        self.assertEqual([r["caller"] for r in check], ["handoff_state.py"])
+        self.assertEqual([r["session_id"] for r in recs], [sid] * len(recs))
+
+    def test_R7_exported_caller_never_stamps_the_own_record(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        for args in ((), ("--resume",)):
+            with self.subTest(args=args):
+                self.log.unlink(missing_ok=True)
+                self.run_state(*args, extra_env={"HANDOFF_CALLER": "handoff_state.py"})
+                (rec,) = self.own_records()
+                self.assertIsNone(rec["caller"])
+
+    def test_R7_fail_codes_and_bytes_null(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        self.run_state()
+        self.run_state("--resume")
+        recs = self.own_records()
+        self.assertEqual(len(recs), 2)
+        for rec in recs:
+            with self.subTest(mode=rec["mode"]):
+                self.assertIn("fail_codes", rec)
+                self.assertIn("handoff_bytes", rec)
+                self.assertIsNone(rec["fail_codes"])
+                self.assertIsNone(rec["handoff_bytes"])
 
 
 # --- 14.2: previous handoff and history file (default mode) ------------------------------------

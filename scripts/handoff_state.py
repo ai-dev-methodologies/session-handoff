@@ -73,6 +73,7 @@ Set HANDOFF_CHECKER to use a checker other than check_handoff.py next to this fi
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -603,6 +604,7 @@ def run_checker(path: Path, in_git: bool) -> int:
     proc = subprocess.run(
         [sys.executable, str(checker), str(path), "--git", "yes" if in_git else "no"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env={**os.environ, "HANDOFF_CALLER": "handoff_state.py"},  # marks the checker's run log record only
     )
     RUN["checker"] = proc.returncode
     out = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
@@ -697,12 +699,18 @@ class _Tee:
         self.stream.flush()
 
     def lines(self) -> list[str]:
-        return "".join(self.parts).splitlines()
+        """Split on "\\n" only: splitlines() would also split on U+2028 and the like inside an indented line."""
+        lines = "".join(self.parts).split("\n")
+        return lines[:-1] if lines[-1] == "" else lines
 
 
 def log_run(argv: list[str], code: int, lines: list[str]) -> None:
-    """Append one run record; a failure only prints a WARNING line on stderr."""
+    """Append one run record; a failure only prints a WARNING line on stderr. The recorded lines go through the
+    checker's redact (a Live subagents name can hold a token); without the checker the record keeps no line."""
     try:
+        with contextlib.redirect_stdout(sys.stderr):  # stdout is already final; a load WARNING goes to stderr
+            mod = checker_module()
+        lines = mod.redact("\n".join(lines)).split("\n") if mod and lines else []
         spec = importlib.util.spec_from_file_location("run_log", Path(__file__).with_name("run_log.py"))
         run_log = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(run_log)
@@ -710,6 +718,7 @@ def log_run(argv: list[str], code: int, lines: list[str]) -> None:
             script="handoff_state.py", mode="resume" if argv[1:2] == ["--resume"] else "handoff",
             cwd=RUN.get("cwd", str(Path.cwd())), toplevel=RUN.get("toplevel"), args=argv, exit_code=code,
             stdout_lines=lines, handoff=RUN.get("handoff"), cont=RUN.get("continue"), checker=RUN.get("checker"),
+            project=RUN.get("project"),
         ))
     except Exception as exc:  # a missing or broken run_log.py never changes the result
         reason = f"{type(exc).__name__}: {exc}"

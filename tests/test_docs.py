@@ -1,3 +1,4 @@
+import importlib.util
 import re
 import subprocess
 import unittest
@@ -9,6 +10,9 @@ RESUME = ROOT / "commands" / "resume-handoff.md"
 README = ROOT / "README.md"
 README_KO = ROOT / "README.ko.md"
 FIELD_MAP = ROOT / "docs" / "field-map.md"
+CHANGELOG = ROOT / "CHANGELOG.md"
+RUN_LOG = ROOT / "scripts" / "run_log.py"
+REPORT_CALL = "python3 ~/.claude/scripts/run_report.py"
 
 # Only used when git cannot list the files; with git, the ignore rules decide.
 SKIP_DIRS = {".git", "scratch", "__pycache__"}
@@ -943,6 +947,73 @@ class ReadmePairTests(unittest.TestCase):
     def test_neither_readme_has_an_em_dash(self):
         self.assertNotIn("—", self.en)
         self.assertNotIn("—", self.ko)
+
+
+class RunReportDocTests(unittest.TestCase):
+    """The run log fields, run_report.py, and where the report call may appear."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.en = read(README)
+        cls.ko = read(README_KO)
+        cls.resume = read(RESUME)
+        cls.handoff = read(HANDOFF)
+
+    @staticmethod
+    def sentences(text):
+        flat = " ".join(text.split())
+        return re.split(r"(?<=[.!?])\s+(?=[A-Z])", flat)
+
+    def _call_sentences(self, text):
+        return [s for s in self.sentences(text) if REPORT_CALL in s]
+
+    def test_R9_readmes_name_run_report_and_new_fields(self):
+        for name, text in (("README.md", self.en), ("README.ko.md", self.ko)):
+            for needle in ("run_report.py", "session_id", "fail_codes", "handoff_bytes",
+                           "HANDOFF_CALLER", "CLAUDE_CODE_SESSION_ID"):
+                self.assertIn(needle, text, f"{name} lacks {needle}")
+
+    def test_R9_readmes_warn_public_paste(self):
+        self.assertRegex(self.en, r"(?i)do not paste[^.\n]*(report|output)[^.\n]*public repositor")
+        self.assertRegex(self.ko, r"공개 저장소[^.\n]*붙여 넣지")
+
+    def test_R9_components_say_six_files(self):
+        self.assertIn("Installs the six files above", self.en)
+        self.assertIn("위 6개 파일을 설치한다", self.ko)
+        self.assertNotIn("five files above", self.en)
+        self.assertNotIn("위 5개 파일", self.ko)
+
+    def test_R9_changelog_top_matches_version(self):
+        spec = importlib.util.spec_from_file_location("run_log_for_docs", RUN_LOG)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        first = re.search(r"(?m)^## \[([^\]]+)\]", read(CHANGELOG))
+        self.assertIsNotNone(first, "no version heading")
+        self.assertEqual(mod.VERSION, first.group(1))
+
+    def test_R9_report_call_only_in_notes(self):
+        resume_notes = self.resume.split("\n## Notes", 1)[1]
+        calls = self._call_sentences(resume_notes)
+        self.assertEqual(1, len(calls), "resume Notes needs exactly one report call sentence")
+        self.assertEqual(1, self.resume.count(REPORT_CALL), "report call outside resume Notes")
+        handoff_paras = [p for p in paragraphs(self.handoff) if REPORT_CALL in p]
+        self.assertEqual(1, self.handoff.count(REPORT_CALL))
+        self.assertEqual(1, len(handoff_paras))
+        self.assertIn("runs.jsonl", handoff_paras[0], "handoff call must sit in the run log paragraph")
+        self.assertGreater(self.handoff.index(REPORT_CALL), self.handoff.index("### Step 6"))
+        self.assertLess(self.handoff.index(REPORT_CALL), self.handoff.index("## Safety rules"))
+        for text in (self.resume, self.handoff):
+            for sentence in self._call_sentences(text):
+                self.assertIn("only when the user asks", sentence)
+
+    def test_R9_report_call_not_in_steps_0_3_table(self):
+        block = self.resume.split("#### What Steps 0–3 do", 1)[1].split("### Step 1", 1)[0]
+        self.assertNotIn("run_report.py", block)
+        rows = [l for l in self.resume.splitlines() if l.startswith("|")]
+        self.assertFalse([l for l in rows if "run_report.py" in l])
+        step_rows = [l for l in block.splitlines() if l.startswith("|")]
+        self.assertEqual(2 + 5, len(step_rows), "Steps 0-3 table row count changed")
+        self.assertIn("one read-only agent", "\n".join(step_rows))
 
 
 HANDLING_VALUES = [

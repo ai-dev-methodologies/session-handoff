@@ -19,6 +19,7 @@ MAPPING = [
     "scripts/handoff_state.py",
     "scripts/check_handoff.py",
     "scripts/run_log.py",
+    "scripts/run_report.py",
 ]
 COMMAND_DOCS = ["commands/handoff.md", "commands/resume-handoff.md"]
 OLD_STATE = "python3 ~/.claude/scripts/handoff_state.py"
@@ -91,7 +92,7 @@ class InstallTest(unittest.TestCase):
         r = run_install(*self.args())
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((snapshot(self.dst), snapshot(self.backup)), before)
-        self.assertIn("summary: new=5 changed=0 same=0", r.stdout)
+        self.assertIn("summary: new=6 changed=0 same=0", r.stdout)
         self.assertEqual(
             r.stdout.rstrip("\n").splitlines()[-1],
             "dry-run: no files changed. Re-run with --yes to apply.",
@@ -108,7 +109,7 @@ class InstallTest(unittest.TestCase):
         for rel in MAPPING:
             self.assertEqual((self.dst / rel).read_bytes(), self.expected(rel))
         self.assertEqual(list(self.backup.iterdir()), [])
-        self.assertIn("summary: new=5 changed=0 same=0", r.stdout)
+        self.assertIn("summary: new=6 changed=0 same=0", r.stdout)
 
     def test_changed_file_is_backed_up_then_replaced(self):
         target = self.dst / "commands/handoff.md"
@@ -116,7 +117,7 @@ class InstallTest(unittest.TestCase):
         target.write_bytes(b"old local edit\n")
         r = run_install(*self.args("--yes"))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("summary: new=4 changed=1 same=0", r.stdout)
+        self.assertIn("summary: new=5 changed=1 same=0", r.stdout)
         self.assertEqual(target.read_bytes(), self.expected("commands/handoff.md"))
         folders = list(self.backup.iterdir())
         self.assertEqual(len(folders), 1)
@@ -133,7 +134,7 @@ class InstallTest(unittest.TestCase):
         before = snapshot(self.dst), snapshot(self.backup)
         r = run_install(*self.args("--yes"))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("summary: new=0 changed=0 same=5", r.stdout)
+        self.assertIn("summary: new=0 changed=0 same=6", r.stdout)
         self.assertEqual((snapshot(self.dst), snapshot(self.backup)), before)
         self.assertEqual(list(self.backup.iterdir()), folders)
 
@@ -203,7 +204,8 @@ class InstallTest(unittest.TestCase):
             self.assertNotIn("python3 ~/.claude/scripts/", text)
             self.assertIn(f'"{exe}" "{scripts}handoff_state.py" <cwd>', text)
             self.assertIn(f'`"{exe}" "{scripts}check_handoff.py" <file>`', text)
-        for rel in ("scripts/handoff_state.py", "scripts/check_handoff.py", "scripts/run_log.py"):
+        for rel in ("scripts/handoff_state.py", "scripts/check_handoff.py", "scripts/run_log.py",
+                    "scripts/run_report.py"):
             self.assertEqual((self.dst / rel).read_bytes(), before[rel])
         self.assertEqual({rel: (self.src / rel).read_bytes() for rel in MAPPING}, before)
 
@@ -212,6 +214,28 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((self.dst / "scripts/run_log.py").read_bytes(),
                          (self.src / "scripts/run_log.py").read_bytes())
+
+    def test_mapping_has_six_entries(self):
+        self.assertEqual(len(MAPPING), 6)
+        self.assertEqual(len(load_module().MAPPING), 6)
+
+    def test_run_report_script_is_installed(self):
+        r = run_install(*self.args("--yes"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((self.dst / "scripts/run_report.py").read_bytes(),
+                         (self.src / "scripts/run_report.py").read_bytes())
+
+    def test_resume_notes_report_call_rewritten(self):
+        # lane E adds the real sentence; here a temp src copy carries a stand-in
+        doc = self.src / "commands/resume-handoff.md"
+        doc.write_bytes(doc.read_bytes() + b"Only when the user asks: python3 ~/.claude/scripts/run_report.py --since 7d\n")
+        r = run_install(*self.args("--yes"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = Path(sys.executable).as_posix()
+        scripts = self.dst.resolve().as_posix() + "/scripts/"
+        text = (self.dst / "commands/resume-handoff.md").read_bytes().decode("utf-8", "surrogateescape")
+        self.assertIn(f'"{exe}" "{scripts}run_report.py" --since 7d', text)
+        self.assertNotIn("python3 ~/.claude/scripts/", text)
 
     def test_rewrite_interpreter_uses_slash_separators_and_quotes(self):
         mod = load_module()
@@ -326,7 +350,7 @@ class InstallTest(unittest.TestCase):
         fake = self.fake_python("bin", "python3")
         r = run_install(*self.args("--yes", "--python", str(fake)))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("summary: new=0 changed=2 same=3", r.stdout)
+        self.assertIn("summary: new=0 changed=2 same=4", r.stdout)
         self.assertEqual(len(list(self.backup.iterdir())), 1)
 
     @unittest.skipIf(os.name == "nt", "POSIX permission bits")

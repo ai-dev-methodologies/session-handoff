@@ -281,7 +281,8 @@ session can resume with one command.
 
 Both scripts append one JSON line per run to `~/.claude/handoffs/.state/runs.jsonl` (the handoff
 file's path, never its body). When the user later asks what happened, read that file together with
-the handoff file it names.
+the handoff file it names. Run `python3 ~/.claude/scripts/run_report.py` only when the user asks what
+happened: it summarizes that file.
 
 Report three lines, without printing the file or asking anything:
 

@@ -4,6 +4,35 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions are dates (`YYYY.MM.DD-N`), the
 same value that every run writes to the run log as `version`.
 
+## [2026.11.09-2] - 2026-11-09
+
+### Added
+- Each run-log line has five new keys, always present (`null` when there is no value), so a line has
+  19 keys: `session_id` (from `CLAUDE_CODE_SESSION_ID` when it is a UUID, 8-4-4-4-12 hex digits;
+  otherwise `null`), `caller` (from `HANDOFF_CALLER`, `handoff_state.py` when it ran the checker),
+  `project`, `fail_codes` and `handoff_bytes`. `fail_codes` is set by `check_handoff.py` only: an
+  object of fixed failure codes with counts, `{}` on a pass. No other environment variable is read.
+  Indented output lines are still dropped and only counted, but a `handoff_state.py` line keeps its
+  unindented `live subagent:` and `handoff branch:` lines, which quote Live subagents item names and
+  the recorded branch; secret-like values in them are written as `REDACTED`. When `check_handoff.py`
+  cannot be loaded, the `handoff_state.py` line is still written but keeps no output line.
+- `scripts/run_report.py` summarizes `runs.jsonl` in one command: runs, versions, warnings, check
+  failures and attempts until a pass, resume results, handoff size, projects, sessions, and old lines
+  without the new keys. Options: `--log` · `--since` · `--project` · `--version` · `--json`. It never
+  writes the log and never prints a record's `stdout` or `args`. Exit codes: 0 done, 2 usage error
+  (including `HANDOFF_LOG=off` without `--log`), unreadable log, or internal error. `install.py`
+  installs it with the other scripts (six files).
+- `handoff_state.py` passes `HANDOFF_CALLER=handoff_state.py` to the checker it runs.
+- `/handoff` and `/resume-handoff` may run `run_report.py`, but only when the user asks what happened.
+  The Steps 0-3 call list of `/resume-handoff` is unchanged.
+
+### Changed
+- `check_handoff.py` records the `project` of a checked file from its `**Toplevel:**` header when that
+  is an existing absolute folder. Its stdout and its exit codes are unchanged, with one exception: a
+  `~user` path that cannot be resolved now ends with exit code 2, where it used to end with a full
+  traceback and exit code 1. stderr then shows the last 5 lines of the traceback, followed by one
+  `WARNING: run log not written: ...` line.
+
 ## [2026.11.09-1] - 2026-11-09
 
 ### Added
