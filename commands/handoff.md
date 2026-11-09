@@ -51,6 +51,12 @@ followed by `(exists)` or `(new)`, printed even when the file does not exist yet
 `context-budget:` line. The status block never lists file names: the full list goes to the file
 named on the `status file:` line.
 
+When `CLAUDE_CODE_SESSION_ID` is set to a UUID, it also prints two lines after the state block, git
+or not: `session id: <uuid>` and `transcript: <absolute path | none (not found)>`. The `session id:`
+value goes into the `**Session:**` header (Step 5). The `transcript:` path is this session's
+transcript file; Step 2 derives the subagent result paths from it. Without the variable neither line
+is printed, and the header reads `**Session:** none`.
+
 Read the rules files it names, in this order, with the `Read` tool before anything else:
 
 1. `user rules file: <path|none>`: `~/.claude/handoff-rules.local.md`, the user's own operating
@@ -144,7 +150,7 @@ scheduled item has the same keys with `fires-at` in place of `result`:
 | `name` | Subagent and runner: `<name> (<id>)`, the id in parentheses being the agent id, task id, shell id, or PID (required; the checker looks for it, and the next session finds the subagent transcript `agent-<id>.jsonl` by it). Scheduled: the name of the wait |
 | `does` | What it is doing |
 | `decision` | The decision it serves: a `What` value from the Decisions table, or a design file path |
-| `result` | Absolute path where the result lands (subagent: its transcript `…/subagents/agent-<id>.jsonl`, or the file it writes its result to; runner: log file) |
+| `result` | Absolute path where the result lands (subagent: its transcript `subagents/agent-<id>.jsonl` inside the folder named by the `transcript:` path without `.jsonl`, or the file it writes its result to; runner: log file) |
 | `fires-at` | Scheduled only: the time or trigger at which it fires |
 | `done-when` | The one observation that means it has returned (a log's last line, a marker file, a transcript stop reason) |
 | `after-return` | What to do once it has returned |
@@ -159,6 +165,11 @@ and put the copy's path in `result`. For an item still running whose output will
 the jobs path in `done-when` (where to watch), put the durable destination in `result`, and make
 the first step of `after-return` "copy the jobs result to `result`". The next session judges live
 work from those paths alone.
+
+A subagent transcript path is built from the `transcript:` line of Step 0: the folder is that path
+without `.jsonl`, and the file is `subagents/agent-<id>.jsonl` inside it. Never guess the folder. When
+the line reads `none (not found)` or is absent, have the subagent write its result to an absolute
+path, and record that path as `result`.
 
 Never invent a value. Do not collect listening ports, Docker state, migration status, or CI
 results; they cost network and database calls, and several of the usual commands are Linux-only.
@@ -197,6 +208,10 @@ Put the handoff this session started from in the `**Continues:**` header line, r
 `**Toplevel:**`: the file `/resume-handoff` loaded at the start of this session, or `none` when the
 session did not start that way. The `previous handoff:` line from Step 0 is a candidate; confirm it
 against how this session actually started.
+
+Put the `session id:` value from Step 0 in the `**Session:**` header line, right after
+`**Continues:**`; write `none` when Step 0 printed no `session id:` line. The checker compares it with
+this session's id.
 
 Write `## Goal (carried)` before `## What We Are Building`, with its five keys:
 
@@ -248,6 +263,29 @@ since an empty one carries no signal.
 If Step 0 printed a `context-budget:` line, put it as the first line of the file as
 `<!-- context-budget: … -->`. If it printed none, write no such line.
 
+**After Handoff.** `/handoff` starts the baseline: only user messages that arrive after it count.
+Whenever a user message arrives after `/handoff` started, whether typed, queued while a tool ran, or
+the answer to a question dialog (for a question-dialog answer, quote the chosen answers: answers to
+several questions joined by ` / `, several choices for one question by `, `), append one line to the
+`## After Handoff` section at the very end of the file (create the section when it is missing):
+
+```
+- 「<user message verbatim>」 → 결정: <what changed and how>
+```
+
+Write the line even when nothing changed: `→ 결정: 변경 없음`. Copy the message as typed; cut one
+over 300 characters to its first 300 plus `…`. Write `REDACTED` only where the checker's printed line
+shows `REDACTED`. If a message holds a secret the checker does not mask, never write the value:
+report `not ready — unmaskable secret in a message` and tell the user. If the secret sits after the
+first 40 characters, quote up to it and end with `…` instead. Otherwise this is the only exception
+to the "exits 0" rule; never run `/handoff` again to clear it (the baseline would move past that
+message). Never rewrite
+the body to absorb the decision: when a decision contradicts the body, this section is later and wins.
+Append only; do not touch existing lines. When `/handoff` runs again (typed by the user or re-run
+through the Skill tool), first add a line for every user message since the previous run that has
+none, and carry every existing line over (as is, or folded into the body with its quote); the
+baseline then moves.
+
 ### Step 6: Check, report and continue
 
 Run `python3 ~/.claude/scripts/check_handoff.py <file> --git yes|no` (`no` only when Step 0
@@ -270,7 +308,8 @@ lines and never prints the value. The fix is to replace the token, or the whole 
 `REDACTED` (no brackets); replacing only the header line still fails. These failures are printed
 before every other failure. The
 `Goal (carried)` comparison does not count that `REDACTED` replacement as a change. Fix those
-items and run it again; do not report until it exits 0. The checker also prints
+items and run it again; do not report until it exits 0 (the one exception: an unmaskable secret in
+a user message, Step 5). The checker also prints
 `WARNING: handoff file is <N> KiB (over 16 KiB)` for a large file, after the result block
 (`[PASS]` or `[FAIL]` and its list); the exit code does not change. Shorten the file as Step 5
 describes. Keep the never-trim list; a file that still exceeds the cap after that is left as it
@@ -278,6 +317,19 @@ is. The checker's limit is fixed at 16 KiB. The project `values` size cap is use
 Step 5 shortening order, and the checker never reads it.
 `/resume-handoff` runs the same checker on load, so a file that passes here is a file the next
 session can resume with one command.
+
+When `CLAUDE_CODE_SESSION_ID` is a UUID, the checker also reads this session's transcript, and two
+more failures can appear. `contract-session` fires when the `**Session:**` line is missing or is not
+this session's id (message `**Session:** must be this session's id <id>`). `after-handoff` fires
+when a user message after the last `/handoff` is not quoted in `## After Handoff` (each line opens
+with `- 「`; a quote nested inside another line does not count): it exits 1 and
+prints each missing message verbatim, at most 5 lines. Fix it by appending the missing lines to
+`## After Handoff` (`→ 결정:` as in Step 5); do not rewrite the body. When the transcript cannot be
+read, it prints `WARNING: after-handoff messages not checked: <reason>` after the result block and
+the exit code does not change. To run the checker by hand from another session on an older file, drop
+the session variable so the writing-side checks are skipped:
+`env -u CLAUDE_CODE_SESSION_ID python3 ~/.claude/scripts/check_handoff.py <file> --git yes|no`
+(on Windows, clear the variable first with `set CLAUDE_CODE_SESSION_ID=`).
 
 Both scripts append one JSON line per run to `~/.claude/handoffs/.state/runs.jsonl` (the handoff
 file's path, never its body). When the user later asks what happened, read that file together with
@@ -293,7 +345,8 @@ Resume: ready — run `/clear`, then `/resume-handoff <short-id>`
 ```
 
 The third line is the user's cue to switch sessions. Write `ready` only when all of these hold;
-otherwise write `not ready — <which condition failed>`, fix it, and run `/handoff` again:
+otherwise write `not ready — <which condition failed>`, fix it, and run `/handoff` again (never to
+clear an after-handoff failure: append the lines instead):
 
 - The checker above exited 0.
 - Every live item in the file names where its result lands (an absolute path that is not under
@@ -302,13 +355,23 @@ otherwise write `not ready — <which condition failed>`, fix it, and run `/hand
   continue under the new session's directory.
 - Nothing decided or designed in this conversation is missing from the file or from a durable
   file the handoff points at.
+- Every user message after the last `/handoff` is quoted in `## After Handoff` (the checker tests
+  this).
 - No write to the handoff file is still pending (a lane whose result you are about to fold in
   within the next minute: fold it in first, then report).
 
 `/handoff` never runs `/clear` itself. The user decides when to switch.
 
-Then continue the task that was in progress. If the user later points out a mistake in the file,
-rewrite the file with the correction.
+The final reply (the three-line report and the rest of that reply) restates the file only and never
+states a plan, a decision, or a next step that differs from it. A plan or decision the file lacks
+goes into its body section first (Edit), then the checker runs again; `## After Handoff` holds user
+messages only.
+
+Then continue the task that was in progress. A user message that arrives after this report gets one
+line in `## After Handoff` (Edit, append only), and the checker runs again. If the user later points
+out a mistake in the file, append its line to `## After Handoff` with the correction after
+`→ 결정:`; Edit the body only for a wrong fact (path, id, command), never Write the whole file, and
+run the checker again.
 
 ## Safety rules
 
@@ -332,6 +395,7 @@ rewrite the file with the correction.
 **Project:** [project name or path]
 **Toplevel:** [the `project key:` value from Step 0, an absolute path]
 **Continues:** [absolute path of the handoff this session started from | none]
+**Session:** [the `session id:` value from Step 0 | none]
 **Topic:** [one-line summary of what this session was about]
 
 ---
@@ -510,6 +574,15 @@ decide the direction.]
 
 [Omit unless the project needs something non-obvious: commands to run it, services that must be
 up, environment variable names that must be set. Names only, never values.]
+
+---
+
+## After Handoff
+
+[Optional, always the last section. User messages only: omit it when no user message arrived after
+`/handoff` started. One line per message, no message skipped:]
+
+- 「[user message verbatim]」 → 결정: [what changed and how | 변경 없음]
 ```
 
 ---

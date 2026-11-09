@@ -69,6 +69,9 @@ WARNING_KINDS = (
     (re.compile(r"WARNING: handoff project differs: "), "handoff project differs"),
     (re.compile(r"WARNING: handoff is older than N days$"), "handoff is older than N days"),
     (re.compile(r"WARNING: branch changed$"), "branch changed"),
+    (re.compile(r"WARNING: after-handoff messages not checked: "), "after-handoff messages not checked"),
+    (re.compile(r"WARNING: N user message\(s\) after the last /handoff are not in the handoff file$"),
+     "user messages after the last /handoff not in the handoff file"),
 )
 
 
@@ -449,17 +452,15 @@ def projects_section(rows):
     return [{"project": k, "runs": n} for k, n in by_count(table)[:TOP]]
 
 
-def transcript_of(sid: "str"):
-    if not SESSION_ID.fullmatch(sid):
+def transcript(sid: "str", find):
+    if not find or not SESSION_ID.fullmatch(sid):  # never glob a value that is not an id
         return None
-    try:
-        found = sorted((Path.home() / ".claude" / "projects").glob(f"*/{sid}.jsonl"))
-    except OSError:
-        return None
-    return str(found[0]) if found else None
+    found = find(sid)
+    return str(found) if found else None
 
 
-def sessions_section(rows):
+def sessions_section(rows, find):
+    """`find` is check_handoff.find_transcript, or None with an older checker (every transcript is then None)."""
     table = {}
     for row in rows:
         raw = row.rec.get("session_id")
@@ -473,7 +474,7 @@ def sessions_section(rows):
         entry["project"] = entry["project"] or row.group
     recent = sorted(table.values(), key=lambda e: e["last"], reverse=True)[:TOP]
     return [{"session_id": e["session_id"], "project": e["project"], "first_ts": e["first_ts"],
-             "runs": e["runs"], "transcript": transcript_of(e["raw"])} for e in recent]
+             "runs": e["runs"], "transcript": transcript(e["raw"], find)} for e in recent]
 
 
 def coverage_section(rows):
@@ -483,7 +484,7 @@ def coverage_section(rows):
     return out
 
 
-def build(log, used_rotated, rows, all_rows, skipped, filters, norm, vocabulary):
+def build(log, used_rotated, rows, all_rows, skipped, filters, norm, vocabulary, find):
     stamps = [r.rec["ts"] for r in rows]
     return {
         "meta": {"log": str(log), "rotated": str(log) + ".1" if used_rotated else None, "records": len(rows),
@@ -496,7 +497,7 @@ def build(log, used_rotated, rows, all_rows, skipped, filters, norm, vocabulary)
         "resume": resume_section(rows, all_rows, norm),
         "handoff_size": size_section(rows),
         "projects": projects_section(rows),
-        "sessions": sessions_section(rows),
+        "sessions": sessions_section(rows, find),
         "coverage": coverage_section(rows),
     }
 
@@ -641,7 +642,8 @@ def report_for(ns) -> "tuple":
             and (since is None or r.dt >= since)
             and (wanted is None or r.group == wanted)]
     filters = {"since": ns.since, "project": ns.project, "version": ns.version}
-    return build(log, used_rotated, rows, all_rows, skipped, filters, norm, checker.FAIL_CODES), path_key
+    find = getattr(checker, "find_transcript", None)
+    return build(log, used_rotated, rows, all_rows, skipped, filters, norm, checker.FAIL_CODES, find), path_key
 
 
 def main(argv: "list") -> "int":

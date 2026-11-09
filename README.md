@@ -130,13 +130,14 @@ The hash of the status file is made from the top-level folder path. The hash of 
 ### Structure of a Handoff File
 | Part | Contents | When continuing |
 |---|---|---|
-| Header lines | `**Project:**` · `**Toplevel:**` (identifies the project) · `**Continues:**` · `**Topic:**` | `Continues` holds the path of the file being continued. `none` for the first one |
+| Header lines | `**Project:**` · `**Toplevel:**` (identifies the project) · `**Continues:**` · `**Session:**` · `**Topic:**` | `Continues` holds the path of the file being continued. `none` for the first one. `Session` holds this session's id, or `none` |
 | `## Confidence` | `high` · `medium` · `low` | Decided anew each time |
 | `## Session State` | Branch · HEAD · changed files · three Live fields (`Live subagents` · `Live runners` · `Live scheduled`) | Move each unresolved Live item, or close it in the history file |
 | `## Goal (carried)` | `Origin` · `Goal` · `Done-when` · `Constraints` · `Changes` | Copy as is. Change it only when the user says to. Only adding new items to the end of `Constraints`, separated by `; `, is free. Existing items stay as they are. `none` means zero items |
 | Work record sections | What we are building · what worked · what did not work · discarded hypotheses · what has not been tried · state of files · decisions (`What` · `Why` · `How` table) · blockers | Move what has ended and what later steps do not use to the history file. Keep what did not work and the discarded hypotheses |
 | `## Closed (pointers)` | The history file path and the keys of the closed items | Only when there are closed items |
 | `## Exact Next Step` | What the next session does first | Written anew each time |
+| `## After Handoff` | One line per user message after `/handoff` started (optional, always last) | Read first in the briefing. Not rewritten into the body |
 
 ## Roles
 - `/handoff` writes what the session knows into one dated file in `~/.claude/handoffs/`. It does not stop running work.
@@ -206,6 +207,17 @@ The original goal and purpose, and the context still in progress, are kept acros
 - `/handoff` only appends lines to the history file. It does not delete or edit existing lines.
 - `/resume-handoff` does not read the history file by default. It reads it only when the `how` of an open item points to a history key.
 - A handoff points to the history file with one line in the `## Closed (pointers)` section.
+
+### After Handoff
+A decision the user gives after `/handoff` starts is not in the file body. Two gates keep it from being lost.
+
+- The handoff file has a header line `**Session:** <id>` (the `session id:` line that `handoff_state.py` prints in `/handoff` Step 0, or `none`) and an optional last section `## After Handoff`. Each user message after `/handoff` starts, whether typed, queued, or a dialog answer, gets one line there: `- 「<user message verbatim>」 → 결정: <what changed and how>`. `→ 결정: 변경 없음` (“no change”) is also a line. The body is not rewritten, and this section wins where it differs from the body.
+- Writing gate: when `CLAUDE_CODE_SESSION_ID` is a UUID, `check_handoff.py` reads this session's transcript. It exits 1 with `after-handoff` when a user message after the last `/handoff` is not quoted in the section (each line opens with `- 「`; a quote nested inside another line does not count), and prints the missing messages verbatim (at most 5). It exits 1 with `contract-session` when `**Session:**` is missing or is not this session's id. To check an older file by hand from another session, run it as `env -u CLAUDE_CODE_SESSION_ID python3 ~/.claude/scripts/check_handoff.py <file> --git yes|no`.
+- Resume gate: when the file's `**Session:**` is a UUID, `handoff_state.py --resume` reads that transcript again. Messages that the section does not quote make `continue: no (unrecorded messages after handoff)`, even with `--c`, and print `WARNING: N user message(s) after the last /handoff are not in the handoff file` with one indented line per message. `project mismatch` and `newer handoff skipped` win over this reason, but the WARNING is printed either way. The briefing starts with an `AFTER HANDOFF:` block. To go on, the user either returns to the old session (`claude --resume <the **Session:** id>`), appends the missing lines to `## After Handoff`, and reruns the checker, or says `계속` in the new session, which applies the missing messages first as the latest decisions.
+- Degrade: when the transcript is missing, unreadable, too large, or in an unknown format, or has no `/handoff` input, both gates print `WARNING: after-handoff messages not checked: <reason>`. Exit codes and `continue:` do not change. A file without `**Session:**`, or with `none`, is not checked on resume.
+- Output contract: when the session variable is a UUID, `handoff_state.py` in its default mode prints two more lines, `session id: <uuid>` and `transcript: <path | none (not found)>`, so the default output is up to 27 lines instead of 25. Without the variable the output is unchanged.
+- `run_report.py` counts two new warning kinds: `after-handoff messages not checked` and `user messages after the last /handoff not in the handoff file`. The two failure codes are counted in `fail_codes`.
+- Accepted limit: the gates compare user messages only. A decision that was reached but never typed, or one the session omitted from the file before `/handoff` ran, is not caught.
 
 ## Run Log
 - Each run of the two scripts appends one JSON line to `~/.claude/handoffs/.state/runs.jsonl`. It records the path of the handoff file, not the body.

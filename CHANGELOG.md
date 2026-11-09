@@ -4,6 +4,46 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions are dates (`YYYY.MM.DD-N`), the
 same value that every run writes to the run log as `version`.
 
+## [2026.11.09-3] - 2026-11-09
+
+### Added
+- After-handoff gate. A decision the user gives after `/handoff` starts is recorded in the handoff
+  file, and both gates compare against the session transcript. The handoff file has a header line
+  `**Session:** <id>` (right after `**Continues:**`; `none` when there is no session id) and an optional
+  last section `## After Handoff` with one line per user message:
+  `- 「<user message verbatim>」 → 결정: <what changed and how>` (`변경 없음` is also a line).
+  Typed messages, queued messages, and question-dialog answers all count.
+- Writing gate: when `CLAUDE_CODE_SESSION_ID` is a UUID, `check_handoff.py` reads this session's
+  transcript and exits 1 with the new failure code `after-handoff` for each user message after the
+  last `/handoff` that the section does not quote, printing those messages verbatim (at most 5). The
+  new failure code `contract-session` fires when `**Session:**` is missing or is not this session's id.
+  To check an older file by hand from another session, run
+  `env -u CLAUDE_CODE_SESSION_ID python3 ~/.claude/scripts/check_handoff.py <file> --git yes|no`.
+- Resume gate: when the file's `**Session:**` is a UUID, `handoff_state.py --resume` prints
+  `WARNING: N user message(s) after the last /handoff are not in the handoff file` with one indented
+  line per message, and `continue: no (unrecorded messages after handoff)`, even with `--c`. The
+  reason order is `project mismatch`, then `newer handoff skipped`, then this one; the WARNING is
+  printed whichever wins. The briefing starts with an `AFTER HANDOFF:` block.
+- Degrade: when the transcript cannot be judged (missing, unreadable, too large, unknown format, no
+  `/handoff` input), both gates print `WARNING: after-handoff messages not checked: <reason>`. Exit
+  codes and `continue:` do not change.
+- `run_report.py` counts two new warning kinds: `after-handoff messages not checked` and
+  `user messages after the last /handoff not in the handoff file`.
+
+### Changed
+- Stdout contract exception: in its default mode `handoff_state.py` prints `session id: <uuid>` and
+  `transcript: <path | none (not found)>` after the state block when `CLAUDE_CODE_SESSION_ID` is a
+  UUID, so the default output is up to 27 lines instead of 25. Without the variable the output is
+  byte-identical to before. `/handoff` uses the printed `transcript:` folder for subagent result paths.
+- `run_report.py` finds a transcript through `check_handoff.find_transcript`. With more than one copy
+  of the session, the most recent copy is chosen; a copy whose status cannot be read is skipped.
+- `handoff_state.py --help` documents the two new lines and the resume gate.
+- The Steps 0-3 call list of `/resume-handoff` is unchanged.
+
+### Known limits
+- A decision that was never typed, or one the session omitted from the file before `/handoff` ran,
+  is not caught. The gates compare user messages only.
+
 ## [2026.11.09-2] - 2026-11-09
 
 ### Added

@@ -28,6 +28,19 @@ words, the first date, path, or slug that names a handoff file is the selector; 
 reported on one `WARNING: ignored argument words:` line. The handoff body is never evidence
 for `continue:`.
 
+In the default mode, when CLAUDE_CODE_SESSION_ID is a UUID, `session id: <id>` and
+`transcript: <path | none (not found)>` follow the state block (also outside git); the path is the
+newest ~/.claude/projects/*/<id>.jsonl. Without the variable there are no such lines.
+
+In resume mode, when the chosen handoff's head carries `**Session:** <UUID>`, that session's transcript
+is read again: the messages the user gave it after its last /handoff input that the file's
+`## After Handoff` section does not quote make `continue: no (unrecorded messages after handoff)`, even
+with `--c`. A `project mismatch` or `newer handoff skipped` reason wins over it, but either way
+`WARNING: N user message(s) after the last /handoff are not in the handoff file` and one indented
+`「<message>」 (HH:MM:SSZ)` line per message (at most 5, then `… and N more`) follow the `handoff:` line.
+When the transcript cannot be judged, `WARNING: after-handoff messages not checked: <reason>` takes that
+place and `continue:` is unchanged. A file without the line, or with `none`, prints neither.
+
 In the default mode, when ~/.claude/scripts/context_budget.py exists, its `--line` output is
 printed as `context-budget: <first line, cut to 200 chars>`. Exit 0 and 2 both count as output
 (2 means over budget); any other exit code or empty output prints a `WARNING: context-budget ...`
@@ -128,6 +141,9 @@ OUTSIDE_WARNING = "WARNING: rules file section outside override points:"
 UNREADABLE_WARNING = "WARNING: unreadable handoff skipped:"
 SKIPPED_WARNING = "WARNING: newer handoff skipped"
 SIZE_WARNING = "WARNING: handoff file is "
+SESSION_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")  # = run_log.SESSION_ID
+UNRECORDED = "no (unrecorded messages after handoff)"
+NOT_CHECKED_WARNING = "WARNING: after-handoff messages not checked:"
 RUN: dict = {}  # facts for the run log, filled while the script runs
 
 
@@ -322,6 +338,17 @@ def budget_line(cwd: Path) -> None:
     print(f"context-budget: {lines[0][:BUDGET_CHARS]}")
 
 
+def session_lines() -> None:
+    """`session id:` and `transcript:` for /handoff Step 0, only when CLAUDE_CODE_SESSION_ID is a UUID."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not SESSION_ID.fullmatch(sid):
+        return
+    print(f"session id: {sid}")
+    find = getattr(checker_module(), "find_transcript", None)
+    found = find(sid) if find else None
+    print(f"transcript: {found if found else 'none (not found)'}")
+
+
 def continue_hit(tok: str) -> str | None:
     """The continue token `tok` stands for, or None."""
     if tok in CONTINUE_FLAGS:
@@ -474,6 +501,39 @@ def resolve_handoff(selector: str | None, project: str) -> tuple[Path | None, li
     if chosen:
         return chosen, warns, None, skip_warns
     return None, warns, (found[0][1][1] or "unknown") if found else None, skip_warns
+
+
+def handoff_session(text: str) -> str | None:
+    """The head's `**Session:**` value when it is a UUID, else None (no line, `none`, anything else)."""
+    for ln in text.splitlines():
+        if ln.startswith("## "):
+            break
+        m = HEAD_FIELD_RE.match(ln.strip())
+        if m and m.group(1).strip() == "Session":
+            value = m.group(2).strip().strip("`")
+            return value if SESSION_ID.fullmatch(value) else None
+    return None
+
+
+def after_handoff_lines(path: Path) -> tuple[bool, list[str]]:
+    """Resume gate: (some message the writing session got after its last /handoff is not quoted in the file,
+    the WARNING line and its indented quotes). Nothing for a file whose head names no session."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    sid = handoff_session(text)
+    if sid is None:
+        return False, []
+    mod = checker_module()
+    try:
+        missing, reason = mod.after_handoff_check(sid, text.split("\n"))
+        shown = mod.shown_quotes(missing)
+    except Exception:  # no checker, or one without the transcript functions (a mixed install)
+        missing, reason = [], "checker unavailable"
+    if reason:
+        return False, [f"{NOT_CHECKED_WARNING} {reason}"]
+    if not missing:
+        return False, []
+    head = f"WARNING: {len(missing)} user message(s) after the last /handoff are not in the handoff file"
+    return True, [head] + [f"  {ln}" for ln in shown]
 
 
 def recorded_field(path: Path, label: str) -> str | None:
@@ -633,10 +693,13 @@ def resume_block(args: list[str], branch: str | None, in_git: bool) -> int:
         key, shown = handoff_project(path.read_text(encoding="utf-8", errors="replace"))
         if key != path_key(RUN["project"]):
             mismatch = shown or "unknown"
+    unrecorded, gate = after_handoff_lines(path) if path is not None else (False, [])
     if mismatch:
         RUN["continue"] = "no (project mismatch)"
     elif skipped:
         RUN["continue"] = "no (newer handoff skipped)"
+    elif unrecorded:
+        RUN["continue"] = UNRECORDED
     else:
         RUN["continue"] = f"yes ({token})" if token else "no"
     print(f"continue: {RUN['continue']}")
@@ -653,6 +716,8 @@ def resume_block(args: list[str], branch: str | None, in_git: bool) -> int:
     print(f"handoff: {path}")
     if mismatch:
         print(f"WARNING: handoff project differs: {mismatch}")
+    for ln in gate:
+        print(ln)
     age_days = (time.time() - path.stat().st_mtime) / 86400
     warn = "  WARNING: handoff is older than 7 days" if age_days > OLD_DAYS else ""
     print(f"handoff age: {age_days:.1f} days{warn}")
@@ -680,6 +745,7 @@ def main(argv: list[str]) -> int:
     resume = bool(rest) and rest[0] == "--resume"
     in_git, branch = state_block(cwd, with_diffstat=not resume)
     if not resume:
+        session_lines()
         budget_line(cwd)
         return 0
     return resume_block(rest[1:], branch, in_git)

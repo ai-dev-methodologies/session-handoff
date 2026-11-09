@@ -29,6 +29,8 @@ JSON_KEYS = ["meta", "runs", "versions", "warnings", "check_failures", "resume",
              "projects", "sessions", "coverage"]
 NEW_KEYS = ("session_id", "caller", "project", "fail_codes", "handoff_bytes")
 HEADER_RE = re.compile(r"records (\d+) · skipped (\d+) malformed")
+AFTER_KIND = "user messages after the last /handoff not in the handoff file"
+NOT_CHECKED_KIND = "after-handoff messages not checked"
 S1, S2, S3 = (f"{n}{n}{n}{n}{n}{n}{n}{n}-aaaa-4bbb-8ccc-{n * 12}" for n in "123")  # UUID-shaped session ids
 
 
@@ -319,8 +321,11 @@ class WarningsTest(ReportCase):
             f"WARNING: {sentinel}",
             f"handoff branch: WARNING:{sentinel} -> changed  WARNING: branch changed",
             f"handoff age: 9.0 days  WARNING: handoff is older than 7 days {sentinel}",  # not at the line end
+            "WARNING: 3 user message(s) after the last /handoff are not in the handoff file",
+            f"WARNING: 3 user message(s) after the last /handoff are not in the handoff file {sentinel}",
+            f"WARNING: after-handoff messages not checked: {sentinel}",
         ])])
-        self.assertEqual(self.kinds(), {"other": 2, "branch changed": 1})
+        self.assertEqual(self.kinds(), {"other": 3, "branch changed": 1, AFTER_KIND: 1, NOT_CHECKED_KIND: 1})
         self.assertNotIn(sentinel, self.text())
 
     def test_R8_every_printed_warning_has_a_kind(self):
@@ -344,6 +349,9 @@ class WarningsTest(ReportCase):
             "WARNING: handoff project differs: /p": "handoff project differs",
             "handoff age: 9.0 days  WARNING: handoff is older than 7 days": "handoff is older than N days",
             "handoff branch: main -> changed  WARNING: branch changed": "branch changed",
+            "WARNING: 2 user message(s) after the last /handoff are not in the handoff file": AFTER_KIND,
+            "WARNING: after-handoff messages not checked: transcript not found": NOT_CHECKED_KIND,
+            "WARNING: after-handoff messages not checked: checker unavailable": NOT_CHECKED_KIND,
         }
         for line, kind in lines.items():
             with self.subTest(line=line):
@@ -366,8 +374,20 @@ class WarningsTest(ReportCase):
         self.assertEqual(listed[0], {"kind": "branch changed", "count": 12})
         self.assertEqual(len(section(self.text(), "Warnings")), 10)
 
+    def test_R8_warning_kinds_after_handoff(self):
+        self.write([
+            resume(warnings=["WARNING: 2 user message(s) after the last /handoff are not in the handoff file"]),
+            resume(warnings=["WARNING: 7 user message(s) after the last /handoff are not in the handoff file"]),
+            resume(warnings=["WARNING: after-handoff messages not checked: transcript not found"]),
+            rec(warnings=["WARNING: after-handoff messages not checked: no /handoff input in transcript"]),
+            resume(warnings=["WARNING: after-handoff messages not checked: checker unavailable"]),
+        ])
+        self.assertEqual(self.kinds(), {AFTER_KIND: 2, NOT_CHECKED_KIND: 3})
+
     def test_R8_usage_and_help_runs_add_no_warnings(self):
         env = {**os.environ, "HANDOFF_LOG": str(self.log)}
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        env.pop("HANDOFF_CALLER", None)
         for argv in ([str(ROOT / "scripts" / "check_handoff.py")],
                      [str(ROOT / "scripts" / "handoff_state.py"), "--help"]):
             subprocess.run([sys.executable, *argv], capture_output=True, env=env)
@@ -402,6 +422,24 @@ class WarningsTest(ReportCase):
         text = "\n".join(section(self.text(), "Resume"))
         self.assertIn("yes 2", text)
 
+    def test_R8_counts_after_handoff_gate(self):
+        self.write([
+            rec(exit=1, fail_codes={"after-handoff": 2, "contract-session": 1}),
+            rec(exit=1, fail_codes={"after-handoff": 1}),
+            resume(**{"continue": "no (unrecorded messages after handoff)"}),
+            resume(**{"continue": "no (unrecorded messages after handoff)"}),
+            resume(**{"continue": "yes (--c)"}),
+        ])
+        data = self.data()
+        codes = data["check_failures"]["codes"]
+        self.assertEqual(codes["after-handoff"], {"runs": 2, "messages": 3})
+        self.assertEqual(codes["contract-session"], {"runs": 1, "messages": 1})
+        self.assertNotIn("other", codes)
+        self.assertEqual(data["resume"]["continue"], {"no (unrecorded messages after handoff)": 2, "yes": 1})
+        text = self.text()
+        self.assertIn("after-handoff", "\n".join(section(text, "Check failures")))
+        self.assertIn("no (unrecorded messages after handoff) 2", "\n".join(section(text, "Resume")))
+
     def test_R8_resume_checker_exit_counts(self):
         self.write([resume(checker=0), resume(checker=0), resume(checker=1), resume(checker=None)])
         self.assertEqual(self.data()["resume"]["checker_exit"], {"0": 2, "1": 1, "none": 1})
@@ -429,6 +467,8 @@ class WarningBodyTest(ReportCase):
         handoff = self.tmp / "2026-11-01-work-session.tmp"
         handoff.write_text(text, encoding="utf-8", newline="\n")
         env = {**os.environ, "HANDOFF_LOG": str(self.log), "PYTHONIOENCODING": "utf-8"}
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        env.pop("HANDOFF_CALLER", None)
         proc = subprocess.run([sys.executable, str(ROOT / "scripts" / "handoff_state.py"), str(repo),
                                "--resume", str(handoff)], capture_output=True, text=True, encoding="utf-8", env=env)
         warnings = [w for ln in self.log.read_text(encoding="utf-8").splitlines() for w in json.loads(ln)["warnings"]]
@@ -660,6 +700,44 @@ class SessionsTest(ReportCase):
         text = "\n".join(section(self.text(), "Sessions"))
         self.assertIn("not found", text)
         self.assertIn(f"~/.claude/projects/x/{sid}.jsonl", text)
+
+    def test_R8_transcript_uses_checker_lookup(self):
+        sid = "11111111-2222-3333-4444-555555555555"
+        first, recent = (self.home / ".claude" / "projects" / name / f"{sid}.jsonl" for name in ("a", "b"))
+        for path, mtime in ((first, 1_700_000_000), (recent, 1_800_000_000)):
+            path.parent.mkdir(parents=True)
+            self._write(path, "{}\n")
+            os.utime(path, (mtime, mtime))
+        self.write([rec(session_id=sid)])
+        (session,) = self.data()["sessions"]
+        self.assertEqual(session["transcript"], str(recent))  # the most recently modified copy, not the first path
+        self.assertFalse(hasattr(run_report, "transcript_of"), "the lookup is check_handoff.find_transcript")
+        with mock.patch.object(check_handoff, "find_transcript", return_value=None) as found, \
+                mock.patch.object(run_report, "checker_module", return_value=check_handoff):
+            self.assertIsNone(self.data()["sessions"][0]["transcript"])
+        found.assert_called_once_with(sid)
+
+    def test_R8_transcript_old_checker(self):
+        sid = "11111111-2222-3333-4444-555555555555"
+        projects = self.home / ".claude" / "projects" / "x"
+        projects.mkdir(parents=True)
+        self._write(projects / f"{sid}.jsonl", "{}\n")
+        self.write([rec(session_id=sid)])
+        folder = self.tmp / "mixed"
+        folder.mkdir()
+        proc = subprocess.run(["git", "show", "1c6bbeb:scripts/check_handoff.py"], cwd=ROOT, capture_output=True)
+        if proc.returncode != 0:
+            self.skipTest("base commit 1c6bbeb is not available")
+        (folder / "check_handoff.py").write_bytes(proc.stdout)
+        for name in ("run_report.py", "run_log.py"):
+            (folder / name).write_bytes((ROOT / "scripts" / name).read_bytes())
+        proc = subprocess.run([sys.executable, str(folder / "run_report.py"), "--log", str(self.log), "--json"],
+                              capture_output=True, text=True, encoding="utf-8", env={**os.environ})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        (session,) = json.loads(proc.stdout)["sessions"]
+        self.assertEqual(session["session_id"], sid)
+        self.assertIsNone(session["transcript"])
 
     def test_R8_invalid_session_id_never_globbed(self):
         token = "gh" + "p_" + "Ab3" * 12  # built here, so no complete token sits in any file

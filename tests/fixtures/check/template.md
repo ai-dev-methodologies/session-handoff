@@ -6,6 +6,7 @@
 **Project:** [project name or path]
 **Toplevel:** [the `project key:` value from Step 0, an absolute path]
 **Continues:** [absolute path of the handoff this session started from | none]
+**Session:** [the `session id:` value from Step 0 | none]
 **Topic:** [one-line summary of what this session was about]
 
 ---
@@ -184,3 +185,12 @@ decide the direction.]
 
 [Omit unless the project needs something non-obvious: commands to run it, services that must be
 up, environment variable names that must be set. Names only, never values.]
+
+---
+
+## After Handoff
+
+[Optional, always the last section. User messages only: omit it when no user message arrived after
+`/handoff` started. One line per message, no message skipped:]
+
+- 「[user message verbatim]」 → 결정: [what changed and how | 변경 없음]

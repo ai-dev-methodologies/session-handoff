@@ -57,9 +57,12 @@ Exit 0 = every check passes. Exit 1 = at least one check failed (listed). Exit 2
 or unreadable, or an unexpected error (traceback tail on stderr).
 """
 import importlib.util
+import json
+import os
 import re
 import sys
 import traceback
+import unicodedata
 from pathlib import Path
 
 SECTIONS = ("What Has NOT Been Tried Yet", "Decisions Made")  # open designs and decisions; blockers and next-step lines are navigation
@@ -117,6 +120,18 @@ NA_WORD = "n/a"  # the value of a git field outside git (--git no)
 VOLATILE_PREFIXES = ("/tmp/claude-", "/private/tmp/claude-")  # background task output, cleared with /tmp
 DRIVE_RE = re.compile(r"^(?:/mnt)?/([A-Za-z])(?=/|$)")  # /c/... and /mnt/c/... -> c:/...
 JOBS_PART = "/.claude/jobs/"
+SESSION_RE = re.compile(r"^\*\*Session:\*\*\s*(.*)$")
+SESSION_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")  # = run_log.SESSION_ID
+RESUME_CALLER = "handoff_state.py"  # a resume checks a file another session wrote: no writing-side checks
+AFTER_SECTION = "After Handoff"
+QUOTE_PREFIX_CHARS = 40  # a message is recorded when 「 plus its first 40 characters (a shorter one 「whole」) is quoted
+QUOTE_MAX_CHARS = 300
+SHOWN_MAX = 5
+TRANSCRIPT_MAX_BYTES = 512 * 1024 * 1024
+TRANSCRIPT_KEYS = ('"user"', '"assistant"', "queued_command")  # only lines holding one are parsed
+COMMAND_TAGS = ("<command-", "<bash-", "<local-command-")  # a typed slash, ! or local command, not a message
+HANDOFF_COMMAND = "<command-name>/handoff</command-name>"
+TIME_RE = re.compile(r"T(\d{2}:\d{2}:\d{2})")
 
 
 def code_slug(text: str) -> str:
@@ -127,7 +142,7 @@ def code_slug(text: str) -> str:
 FAIL_CODES = (  # the closed vocabulary of the run log's fail_codes: constants only, never message text
     ("decisions-table", "contract-toplevel", "contract-continues", "contract-closed", "contract-live-chain",
      "contract-goal-missing", "contract-goal-drift", "contract-session-state", "contract-next-step",
-     "usage", "unreadable", "internal", "secret:other")
+     "usage", "unreadable", "internal", "secret:other", "after-handoff", "contract-session")
     + tuple(f"secret:{code_slug(label)}" for label, _ in SECRET_PATTERNS) + (f"secret:{code_slug(KEY_KIND)}",)
     + tuple(f"item-incomplete:{code_slug(title)}" for title in SECTIONS)
 )
@@ -606,6 +621,204 @@ def resume_contract_failures(lines: "list[str]", git: "bool | None" = None, path
     return [msg for _, msgs in resume_contract_parts(lines, git, path) for msg in msgs]
 
 
+def find_transcript(session_id: str) -> "Path | None":
+    """~/.claude/projects/*/<id>.jsonl for a UUID: the most recently modified copy, on a tie the first path."""
+    if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
+        return None
+    try:
+        found = sorted((Path.home() / ".claude" / "projects").glob(f"*/{session_id}.jsonl"))
+    except (OSError, RuntimeError, KeyError):  # no home
+        return None
+    best, newest = None, 0.0
+    for p in found:
+        try:
+            mtime = p.stat().st_mtime
+        except (OSError, RuntimeError):  # a copy gone between glob and stat, or a symlink loop: skip that one
+            continue
+        if best is None or mtime > newest:
+            best, newest = p, mtime
+    return best
+
+
+def content_text(content) -> str:
+    """A message content as text: the string itself, or its text blocks joined; anything else is no text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b["text"] for b in content
+                         if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
+    return ""
+
+
+def answers_text(rec: dict) -> str:
+    """A dialog answer (toolUseResult.answers) as its values joined by ` / `, a list of strings by `, `."""
+    result = rec.get("toolUseResult")
+    answers = result.get("answers") if isinstance(result, dict) else None
+    if not isinstance(answers, dict):
+        return ""
+    parts = []
+    for value in answers.values():
+        if isinstance(value, list):
+            value = ", ".join(v for v in value if isinstance(v, str))
+        if isinstance(value, str) and value.strip():
+            parts.append(value)
+    return " / ".join(parts)
+
+
+def record_text(rec: dict) -> str:
+    """The text a record carries: a queued message's prompt, a dialog answer, else the message content."""
+    if rec.get("type") == "attachment":
+        att = rec.get("attachment")
+        prompt = att.get("prompt") if isinstance(att, dict) else None
+        return content_text(prompt)
+    message = rec.get("message")
+    return answers_text(rec) or content_text(message.get("content") if isinstance(message, dict) else None)
+
+
+def classify_record(rec: dict) -> "str | None":
+    """"baseline" for a /handoff input, "message" for a message the user gave the session, else None.
+    The first matching row decides (new-format-spec section 20)."""
+    kind = rec.get("type")
+    if kind == "assistant":
+        message = rec.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Skill":
+                given = block.get("input")
+                skill = given.get("skill") if isinstance(given, dict) else None
+                if isinstance(skill, str) and (skill == "handoff" or skill.endswith(":handoff")):
+                    return "baseline"
+        return None
+    if kind == "attachment":
+        att = rec.get("attachment")
+        if not isinstance(att, dict) or att.get("type") != "queued_command":
+            return None
+        origin, prompt = att.get("origin"), att.get("prompt")
+        human = isinstance(origin, dict) and origin.get("kind") == "human"
+        return "message" if human and content_text(prompt).strip() else None
+    if kind != "user":
+        return None
+    message = rec.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    text = content_text(content).lstrip()
+    if not rec.get("isMeta") and text.startswith("<command-") and HANDOFF_COMMAND in text:
+        return "baseline"
+    if rec.get("isMeta") or rec.get("promptSource") == "system":
+        return None
+    if answers_text(rec):
+        return "message"
+    origin = rec.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return None
+    if text.startswith(COMMAND_TAGS) or not text.strip():
+        return None
+    return "message"
+
+
+def normalize(text: str) -> str:
+    """Secret-like values as REDACTED, NFC, every run of whitespace as one space."""
+    return " ".join(unicodedata.normalize("NFC", redact(text)).split())
+
+
+def message_time(rec: dict) -> str:
+    """A queued message's attachment timestamp, else the record timestamp; "" when absent."""
+    att = rec.get("attachment")
+    ts = att.get("timestamp") if rec.get("type") == "attachment" and isinstance(att, dict) else rec.get("timestamp")
+    return ts if isinstance(ts, str) else ""
+
+
+def messages_after_handoff(path: Path) -> "tuple[list[tuple[str, str]], str | None]":
+    """(normalized text, timestamp) of each message after the last /handoff input, by position in the file,
+    a text given twice listed twice; or ([], reason) when the transcript cannot be judged. Never raises."""
+    try:
+        if path.stat().st_size > TRANSCRIPT_MAX_BYTES:
+            return [], "transcript too large"
+        msgs, human, baseline = [], False, False
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not any(key in line for key in TRANSCRIPT_KEYS):
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                human = human or (rec.get("type") == "user" and isinstance(rec.get("origin"), dict))
+                label = classify_record(rec)
+                if label == "baseline":
+                    msgs, baseline = [], True
+                elif label == "message":
+                    msgs.append((normalize(record_text(rec)), message_time(rec)))
+        if not human:
+            return [], "transcript format unknown"
+        if not baseline:
+            return [], "no /handoff input in transcript"
+        return [(text, ts) for text, ts in msgs if text], None
+    except OSError:
+        return [], "transcript unreadable"
+    except Exception:  # a record shape this code does not know: the gate steps aside, the run goes on
+        return [], "transcript format unknown"
+
+
+def unrecorded(msgs: "list[tuple[str, str]]", section_text: str) -> "list[tuple[str, str]]":
+    """The messages the section does not quote. A message is quoted by a list item opening with `- 「` plus its
+    first QUOTE_PREFIX_CHARS characters (a shorter one `- 「whole」`); k messages with the same quote need k items,
+    the first ones count. A quote nested inside another item's text does not count."""
+    body = normalize(section_text)
+    used, out = {}, []
+    for text, ts in msgs:
+        n = normalize(text)
+        needle = "- 「" + (n[:QUOTE_PREFIX_CHARS] if len(n) >= QUOTE_PREFIX_CHARS else n + "」")
+        used[needle] = used.get(needle, 0) + 1
+        if used[needle] > body.count(needle):
+            out.append((text, ts))
+    return out
+
+
+def shown_quotes(msgs: "list[tuple[str, str]]") -> "list[str]":
+    """`「<text, cut at QUOTE_MAX_CHARS>」 (HH:MM:SSZ)` for the first SHOWN_MAX messages, then `… and N more`."""
+    out = []
+    for text, ts in msgs[:SHOWN_MAX]:
+        n = normalize(text)
+        shown = n if len(n) <= QUOTE_MAX_CHARS else n[:QUOTE_MAX_CHARS] + "…"
+        m = TIME_RE.search(ts)
+        out.append(f"「{shown}」" + (f" ({m.group(1)}Z)" if m else ""))
+    if len(msgs) > SHOWN_MAX:
+        out.append(f"… and {len(msgs) - SHOWN_MAX} more")
+    return out
+
+
+def writer_session() -> "str | None":
+    """This session's id when the checker runs on the writing side: CLAUDE_CODE_SESSION_ID is a UUID and the
+    caller is not handoff_state.py."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not SESSION_ID.fullmatch(sid) or os.environ.get("HANDOFF_CALLER") == RESUME_CALLER:
+        return None
+    return sid
+
+
+def session_failures(lines: "list[str]", session_id: str) -> "list[str]":
+    """The head carries `**Session:** <this session's id>`."""
+    if head_value(lines, SESSION_RE) != session_id:
+        return [f"**Session:** must be this session's id {session_id}"]
+    return []
+
+
+def after_handoff_check(session_id: str, lines: "list[str]") -> "tuple[list[tuple[str, str]], str | None]":
+    """(messages after the last /handoff missing from After Handoff, None), or ([], why they were not checked)."""
+    try:
+        path = find_transcript(session_id)
+        if path is None:
+            return [], "transcript not found"
+        msgs, reason = messages_after_handoff(path)
+        if reason:
+            return [], reason
+        return unrecorded(msgs, section_body(lines, AFTER_SECTION) or ""), None
+    except Exception:
+        return [], "transcript format unknown"
+
+
 def split_cells(line: str) -> "list[str]":
     inner = line.strip()
     inner = inner[1:] if inner.startswith("|") else inner
@@ -712,10 +925,14 @@ def main(argv: "list[str]") -> int:
                 failures.append((title, flat[:120]))
     decisions = decisions_failures(lines)
     contract_pairs = resume_contract_parts(lines, git, path)
+    session, after, after_reason = writer_session(), [], None
+    if session:  # the writing side: the head names this session, and its late messages are recorded
+        contract_pairs.insert(2, ("contract-session", session_failures(lines, session)))
+        after, after_reason = after_handoff_check(session, lines)
     contract = [msg for _, msgs in contract_pairs for msg in msgs]
     RUN["parts"] = ([(secret_code(kind), [msg]) for kind, msg in secret_pairs]
                     + [(f"item-incomplete:{code_slug(title)}", [head]) for title, head in failures]
-                    + [("decisions-table", decisions)] + contract_pairs)
+                    + [("decisions-table", decisions)] + contract_pairs + [("after-handoff", [t for t, _ in after])])
     if secrets:  # first: the resume excerpt keeps only the first lines of this output
         print(f"[FAIL] {len(secrets)} secret-like value(s):")
         for msg in secrets:
@@ -732,7 +949,11 @@ def main(argv: "list[str]") -> int:
         print(f"[FAIL] {len(contract)} resume-contract problem(s):")
         for msg in contract:
             print(f"  - {msg}")
-    code = 1 if failures or decisions or contract or secrets else 0
+    if after:
+        print(f'[FAIL] {len(after)} user message(s) after the last /handoff are not in "{AFTER_SECTION}":')
+        for line in shown_quotes(after):
+            print(f"  - {line}")
+    code = 1 if failures or decisions or contract or secrets or after else 0
     if not code:
         print("[PASS] open items carry what/why/how or a design path; Decisions table and resume contract satisfied; "
               "no secret-like values")
@@ -740,6 +961,8 @@ def main(argv: "list[str]") -> int:
     RUN["size"] = size
     if size > SIZE_LIMIT_KIB * 1024:
         print(f"WARNING: handoff file is {-(-size // 1024)} KiB (over {SIZE_LIMIT_KIB} KiB)")
+    if after_reason:
+        print(f"WARNING: after-handoff messages not checked: {after_reason}")
     return code
 
 

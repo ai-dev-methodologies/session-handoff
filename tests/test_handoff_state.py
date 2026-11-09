@@ -1745,6 +1745,12 @@ class A5WithWarningsTests(StateTestCase):
     def test_M4_resume_mode_with_warnings(self):
         self.check(self.run_state("--resume"), whole_cap=None)
 
+    def test_AH27_default_cap_with_env(self):
+        put_transcript(self.home, FULL)
+        proc = self.run_state(extra_env={"CLAUDE_CODE_SESSION_ID": SID})
+        self.assertEqual(len(self.lines_with(proc.stdout, "session id: ")), 1, proc.stdout)
+        self.check(proc, whole_cap=27)  # spec 16.6: 25, plus the two session lines
+
 
 # --- L-12: an unexpected error is exit 4 ------------------------------------------------------------
 class InternalErrorTests(StateTestCase):
@@ -1765,6 +1771,251 @@ class InternalErrorTests(StateTestCase):
         self.assertIn("RuntimeError: state bug here", tail[-1])
         rec = json.loads((self.tmp / "runs.jsonl").read_text(encoding="utf-8").splitlines()[-1])
         self.assertEqual(rec["exit"], 4)
+
+
+# --- AH: session lines and the resume gate on messages after the last /handoff ----------------------
+TRANSCRIPT = Path(__file__).resolve().parent / "fixtures" / "transcript" / "incident.jsonl"
+SID = "00000000-0000-4000-8000-000000000001"  # the fixture's session id
+M1 = "Move part C to the second round and ship A and B first."
+M2 = "검토자에게는 A와 B 문서만 이슈 목록 없이 먼저 보낸다."
+A1 = "A and B now, C later"  # the dialog answer of fixture line 33
+M3 = "Also keep part D out of this round."  # typed after the handoff was checked
+CUT_BEFORE, FULL = 25, 35  # fixture line counts: before M1·M2 are delivered, everything
+GATE_BASE = "1c6bbeb"  # handoff_state.py and check_handoff.py before the after-handoff gate
+UNRECORDED = "no (unrecorded messages after handoff)"
+NOT_CHECKED = "WARNING: after-handoff messages not checked: "
+
+
+def put_transcript(home, count, extra=()):
+    """The first `count` fixture lines plus `extra` lines as ~/.claude/projects/-tmp-demo/<SID>.jsonl."""
+    lines = TRANSCRIPT.read_text(encoding="utf-8").splitlines()[:count] + list(extra)
+    folder = home / ".claude" / "projects" / "-tmp-demo"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{SID}.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    return path
+
+
+def m3_line():
+    return json.dumps({"type": "user", "timestamp": "2026-11-09T07:00:00.000Z", "cwd": "/tmp/demo", "gitBranch": "main",
+                       "sessionId": SID, "origin": {"kind": "human"}, "message": {"role": "user", "content": M3}},
+                      ensure_ascii=False)
+
+
+def image_queued_line(text):
+    """A queued message delivered as content blocks: the text, then a pasted image."""
+    prompt = [{"type": "text", "text": text},
+              {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}]
+    return json.dumps({"type": "attachment", "timestamp": "2026-11-09T06:55:42.000Z", "sessionId": SID,
+                       "attachment": {"type": "queued_command", "prompt": prompt, "commandMode": "prompt",
+                                      "origin": {"kind": "human"}, "timestamp": "2026-11-09T06:55:42.000Z"}},
+                      ensure_ascii=False)
+
+
+def base_scripts(folder, names=("handoff_state.py", "check_handoff.py", "run_log.py")):
+    """Write the GATE_BASE copies of `names` into `folder`; raise SkipTest when git or the commit is missing."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        proc = subprocess.run(["git", "show", f"{GATE_BASE}:scripts/{name}"], cwd=ROOT, capture_output=True)
+        if proc.returncode != 0:
+            raise unittest.SkipTest(f"base commit {GATE_BASE} is not available")
+        (folder / name).write_bytes(proc.stdout)
+    return folder
+
+
+class SessionLineTests(StateTestCase):
+    def setUp(self):
+        super().setUp()
+        self.init_repo({"a.txt": "a\n"})
+        budget = self.home / ".claude" / "scripts" / "context_budget.py"
+        budget.parent.mkdir(parents=True)
+        budget.write_text("print('budget 42%')\n", encoding="utf-8")
+
+    def assert_session_lines(self, proc, last_state_line, transcript):
+        out = proc.stdout.splitlines()
+        i = next(n for n, ln in enumerate(out) if ln.startswith(last_state_line))
+        self.assertEqual(out[i + 1:i + 4], [f"session id: {SID}", f"transcript: {transcript}", "context-budget: budget 42%"],
+                         proc.stdout)
+
+    def test_AH20_default_session_lines(self):
+        path = put_transcript(self.home, FULL)
+        env = {"CLAUDE_CODE_SESSION_ID": SID}
+        self.assert_session_lines(self.run_state(extra_env=env), "diffstat:", path)
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        proc = self.run_state(extra_env=env, cwd=plain)
+        self.assertIn("toplevel: not a git repository", proc.stdout)
+        self.assert_session_lines(proc, "head: none", path)
+        path.unlink()
+        self.assert_session_lines(self.run_state(extra_env=env), "diffstat:", "none (not found)")
+        for value in (None, "not-a-uuid"):
+            with self.subTest(env=value):
+                proc = self.run_state(extra_env={"CLAUDE_CODE_SESSION_ID": value} if value else None)
+                self.assertEqual(self.lines_with(proc.stdout, "session id:") + self.lines_with(proc.stdout, "transcript:"),
+                                 [], proc.stdout)
+        resume = self.run_state("--resume", extra_env=env)
+        self.assertNotIn("session id:", resume.stdout, "the lines are /handoff Step 0 only")
+
+    def test_AH20b_session_rule_is_run_log_rule(self):
+        import importlib.util
+        mods = {}
+        for name, path in (("hs", SCRIPT), ("rl", ROOT / "scripts" / "run_log.py")):
+            spec = importlib.util.spec_from_file_location(f"{name}_session_rule", path)
+            mods[name] = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mods[name])
+        self.assertEqual(mods["hs"].SESSION_ID.pattern, mods["rl"].SESSION_ID.pattern)
+
+
+class ResumeGateTests(StateTestCase):
+    def setUp(self):
+        super().setUp()
+        self.init_repo({"a.txt": "a\n"})
+        self.log = self.tmp / "runs.jsonl"
+
+    def text(self, *quotes, session=SID, toplevel=None):
+        text = self.valid_handoff_text(toplevel=toplevel).replace(
+            "**Continues:** none", f"**Continues:** none\n**Session:** {session}", 1)
+        if quotes:
+            text += "\n## After Handoff\n\n" + "".join(f"- 「{q}」 → 결정: 변경 없음\n" for q in quotes)
+        return text
+
+    def resume(self, *args, **kw):
+        proc = self.run_state("--resume", *args, **kw)
+        self.assertEqual(proc.returncode, 0, self.combined(proc))
+        self.assertNotIn("Traceback", proc.stderr)
+        return proc
+
+    def continue_line(self, proc):
+        (line,) = self.lines_with(proc.stdout, "continue:")
+        return line
+
+    def gate_lines(self, proc):
+        """The after-handoff WARNING line, the indented lines right after it, and their place after `handoff:`."""
+        out = proc.stdout.splitlines()
+        i = next((n for n, ln in enumerate(out) if "after the last /handoff" in ln or ln.startswith(NOT_CHECKED)), None)
+        self.assertIsNotNone(i, f"no after-handoff WARNING line:\n{proc.stdout}")
+        j = i + 1
+        while j < len(out) and out[j].startswith(("  「", "  … and ")):
+            j += 1
+        return out[i:j], out[:i]
+
+    def test_AH21_resume_gate_overrides_continue(self):
+        put_transcript(self.home, FULL, [m3_line()])
+        self.write_handoff("2026-11-01-work-session.tmp", self.text(M1, M2, A1))
+        proc = self.resume("--c")
+        self.assertEqual(self.continue_line(proc), f"continue: {UNRECORDED}")
+        block, before = self.gate_lines(proc)
+        self.assertEqual(block, ["WARNING: 1 user message(s) after the last /handoff are not in the handoff file",
+                                 f"  「{M3}」 (07:00:00Z)"], proc.stdout)
+        self.assertTrue(before[-1].startswith("handoff: "), proc.stdout)
+        self.assertIn("handoff check: exit 0", proc.stdout)
+
+    def test_AH21b_resume_dialog_answer(self):
+        put_transcript(self.home, FULL, [m3_line()])
+        self.write_handoff("2026-11-01-work-session.tmp", self.text(M1, M2, M3))
+        proc = self.resume("--c")
+        self.assertEqual(self.continue_line(proc), f"continue: {UNRECORDED}")
+        self.assertEqual(self.gate_lines(proc)[0][1:], [f"  「{A1}」 (06:56:30Z)"], proc.stdout)
+
+    def test_AH21c_resume_queued_message_with_image(self):
+        said = "Ship the screenshot fix first."
+        put_transcript(self.home, CUT_BEFORE, [image_queued_line(said)])
+        self.write_handoff("2026-11-01-work-session.tmp", self.text())
+        proc = self.resume("--c")
+        self.assertEqual(self.continue_line(proc), f"continue: {UNRECORDED}")
+        self.assertEqual(self.gate_lines(proc)[0][1:], [f"  「{said}」 (06:55:42Z)"], proc.stdout)
+
+    def test_AH22_resume_all_quoted(self):
+        put_transcript(self.home, FULL, [m3_line()])
+        self.write_handoff("2026-11-01-work-session.tmp", self.text(M1, M2, A1, M3))
+        proc = self.resume("--c")
+        self.assertEqual(self.continue_line(proc), "continue: yes (--c)")
+        self.assertNotIn("after the last /handoff", proc.stdout)
+        self.assertNotIn("after-handoff", proc.stdout)
+
+    def test_AH23_resume_degrade(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.text(M1, M2, A1))
+        proc = self.resume("--c")  # no transcript at all
+        self.assertEqual(self.continue_line(proc), "continue: yes (--c)")
+        self.assertEqual(self.gate_lines(proc)[0], [NOT_CHECKED + "transcript not found"], proc.stdout)
+        put_transcript(self.home, FULL, [m3_line()])
+        folder = base_scripts(self.tmp / "mixed", names=("check_handoff.py",))
+        for name in ("handoff_state.py", "run_log.py"):
+            (folder / name).write_bytes((ROOT / "scripts" / name).read_bytes())
+        proc = subprocess.run([sys.executable, str(folder / "handoff_state.py"), str(self.repo), "--resume", "--c"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              env=self.env(), cwd=str(self.tmp))
+        self.assertEqual(proc.returncode, 0, self.combined(proc))
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(self.continue_line(proc), "continue: yes (--c)")
+        self.assertEqual(self.gate_lines(proc)[0], [NOT_CHECKED + "checker unavailable"], proc.stdout)
+        self.assertNotIn(M3, proc.stdout)
+
+    def test_AH24_precedence_overlaps(self):
+        put_transcript(self.home, FULL, [m3_line()])
+        other = self.tmp / "other"
+        other.mkdir()
+        explicit = self.tmp / "2026-11-01-other-session.tmp"
+        explicit.write_text(self.text(M1, M2, A1, toplevel=other.as_posix()), encoding="utf-8", newline="\n")
+        proc = self.resume(str(explicit), "--c")
+        self.assertEqual(self.continue_line(proc), "continue: no (project mismatch)")
+        block, before = self.gate_lines(proc)
+        self.assertEqual(block[1:], [f"  「{M3}」 (07:00:00Z)"], proc.stdout)
+        self.assertTrue(before[-1].startswith("WARNING: handoff project differs: "), proc.stdout)
+        self.assertTrue(before[-2].startswith("handoff: "), proc.stdout)
+
+        self.write_handoff("2026-11-01-old-session.tmp", self.text(M1, M2, A1), mtime=1_700_000_000)
+        self.write_handoff("2026-11-02-new-session.tmp", self.text(M1, M2, A1).replace(
+            "Run the unit tests and read the first failure.", "[next step]"), mtime=1_800_000_000)
+        proc = self.resume("--c")
+        self.assertEqual(self.continue_line(proc), "continue: no (newer handoff skipped)")
+        self.assertEqual(self.gate_lines(proc)[0][1:], [f"  「{M3}」 (07:00:00Z)"], proc.stdout)
+
+        (self.handoffs / "2026-11-02-new-session.tmp").unlink()
+        self.assertEqual(self.continue_line(self.resume("--c")), f"continue: {UNRECORDED}")
+        self.assertEqual(self.continue_line(self.resume()), f"continue: {UNRECORDED}")
+
+    def test_AH25_old_handoff_unchanged(self):
+        old = base_scripts(self.tmp / "old")
+        put_transcript(self.home, FULL, [m3_line()])
+        plain = self.valid_handoff_text()
+        cases = {"no Session line": plain, "Session none": self.text(session="none"),
+                 "Session not a UUID": self.text(session="abc")}
+        for label, text in cases.items():
+            for env in ({}, {"CLAUDE_CODE_SESSION_ID": SID}):
+                with self.subTest(case=label, env=bool(env)):
+                    self.write_handoff("2026-11-01-work-session.tmp", text)
+                    runs = [subprocess.run([sys.executable, str(script), str(self.repo), "--resume", "--c"],
+                                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                           env=self.env(HANDOFF_LOG="off", **env), cwd=str(self.tmp))
+                            for script in (old / "handoff_state.py", SCRIPT)]
+                    self.assertEqual((runs[1].returncode, runs[1].stdout), (runs[0].returncode, runs[0].stdout))
+        default = [subprocess.run([sys.executable, str(script), str(self.repo)], capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", env=self.env(HANDOFF_LOG="off"), cwd=str(self.tmp))
+                   for script in (old / "handoff_state.py", SCRIPT)]
+        self.assertEqual((default[1].returncode, default[1].stdout), (default[0].returncode, default[0].stdout))
+
+    def test_AH25b_session_line_in_body_is_not_the_head(self):
+        put_transcript(self.home, FULL, [m3_line()])
+        self.write_handoff("2026-11-01-work-session.tmp",
+                           self.valid_handoff_text() + f"\n## Notes\n\n**Session:** {SID}\n")
+        proc = self.resume("--c")
+        self.assertEqual(self.continue_line(proc), "continue: yes (--c)")
+        self.assertNotIn("after the last /handoff", proc.stdout)
+        self.assertNotIn("after-handoff", proc.stdout)
+
+    def test_AH26_privacy(self):
+        put_transcript(self.home, FULL, [m3_line()])
+        self.write_handoff("2026-11-01-work-session.tmp", self.text(M1, M2, A1))
+        proc = self.resume("--c", extra_env={"CLAUDE_CODE_SESSION_ID": "11111111-1111-4111-8111-111111111111"})
+        self.assertIn(M3, proc.stdout)
+        log = self.log.read_text(encoding="utf-8")
+        self.assertEqual(log.count("part D out"), 0)
+        recs = [json.loads(ln) for ln in log.splitlines()]
+        (rec,) = [r for r in recs if r["script"] == "handoff_state.py"]
+        self.assertEqual(rec["continue"], UNRECORDED)
+        self.assertIn("WARNING: 1 user message(s) after the last /handoff are not in the handoff file", rec["warnings"])
+        self.assertEqual({len(r) for r in recs}, {19})
 
 
 if __name__ == "__main__":

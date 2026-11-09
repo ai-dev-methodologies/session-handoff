@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1622,6 +1623,8 @@ class FailCodeTest(SignalCase):
         mod = load_checker()
         env = {"HOME": str(self.home), "USERPROFILE": str(self.home), "HANDOFF_LOG": str(self.tmp / "runs.jsonl")}
         with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            os.environ.pop("HANDOFF_CALLER", None)
             self.assertEqual(mod.run([]), 2)  # usage: leaves RUN["fail"] behind
             self.assertEqual(mod.run([str(good), "--git", "yes"]), 0)  # leaves RUN["size"] behind
             self.assertEqual(mod.run([str(self.tmp / "nope.md")]), 2)
@@ -1644,6 +1647,8 @@ class FailCodeTest(SignalCase):
                     out, err = io.StringIO(), io.StringIO()
                     with mock.patch.dict(os.environ, env), mock.patch.object(mod, name, side_effect=RuntimeError("boom")), \
                             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+                        os.environ.pop("HANDOFF_CALLER", None)
                         code = mod.run([str(path), "--git", "yes"])
                     self.assertEqual(code, want, out.getvalue() + err.getvalue())
                     self.assertEqual(err.getvalue().count("WARNING: run log not written:"), 1, err.getvalue())
@@ -1657,6 +1662,8 @@ class FailCodeTest(SignalCase):
         # main() fills RUN["parts"] first, then raises at the size check
         with mock.patch.dict(os.environ, env), mock.patch.object(mod, "SIZE_LIMIT_KIB", None), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+            os.environ.pop("HANDOFF_CALLER", None)
             code = mod.run([str(bad), "--git", "yes"])
         self.assertEqual(code, 2)
         self.assertEqual(tail_record(self.tmp / "runs.jsonl")["fail_codes"], {"internal": 1})
@@ -1859,6 +1866,378 @@ class BaseStdoutTest(SignalCase):
             old, new = self.both([str(self.tmp / "nope.md")])
             self.assertEqual(old.returncode, 2)
             self.assertEqual((new.returncode, new.stdout), (old.returncode, old.stdout))
+
+
+TRANSCRIPT = ROOT / "tests" / "fixtures" / "transcript" / "incident.jsonl"
+SID = "00000000-0000-4000-8000-000000000001"  # the fixture's session id
+M1 = "Move part C to the second round and ship A and B first."
+M2 = "검토자에게는 A와 B 문서만 이슈 목록 없이 먼저 보낸다."
+A1 = "A and B now, C later"  # the dialog answer of fixture line 33
+CUT_BEFORE, CUT_DELIVERED, FULL = 25, 31, 35  # fixture line counts: before M1·M2 are delivered, after, everything
+GATE_BASE = "1c6bbeb"  # the checker before the after-handoff gate
+
+
+def user_rec(text, ts="2026-11-09T07:00:00.000Z", **kw):
+    """A JSON line of a message the user typed."""
+    rec = {"type": "user", "timestamp": ts, "cwd": "/tmp/demo", "sessionId": SID, "origin": {"kind": "human"},
+           "message": {"role": "user", "content": text}}
+    rec.update(kw)
+    return json.dumps(rec, ensure_ascii=False)
+
+
+def queued_rec(prompt, enqueued="2026-11-09T07:00:00.000Z", kind="human"):
+    """A JSON line of a queued message delivered to the session; its timestamps are the enqueue time."""
+    return json.dumps({"type": "attachment", "timestamp": enqueued, "sessionId": SID,
+                       "attachment": {"type": "queued_command", "prompt": prompt, "commandMode": "prompt",
+                                      "origin": {"kind": kind}, "timestamp": enqueued}}, ensure_ascii=False)
+
+
+def image_prompt(text):
+    """A queued prompt as content blocks: the text, then a pasted image (the shape real transcripts carry)."""
+    return [{"type": "text", "text": text},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}]
+
+
+class AfterHandoffTests(SignalCase):
+    def setUp(self):
+        super().setUp()
+        self.mod = load_checker()
+        self.text = self.base.replace("**Continues:** none", f"**Continues:** none\n**Session:** {SID}", 1)
+        self.lines = TRANSCRIPT.read_text(encoding="utf-8").splitlines()
+
+    def put(self, lines):
+        folder = self.home / ".claude" / "projects" / "-tmp-demo"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{SID}.jsonl"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        return path
+
+    def gate(self, text, **extra):
+        return self.run_text(text, args=("--git", "yes"), extra_env={"CLAUDE_CODE_SESSION_ID": SID, **extra})
+
+    def with_after(self, *quotes, text=None):
+        body = "\n".join(f"- 「{q}」 → 결정: 변경 없음" for q in quotes)
+        return (text or self.text).rstrip("\n") + f"\n\n## After Handoff\n\n{body}\n"
+
+    def texts(self, lines):
+        msgs, reason = self.mod.messages_after_handoff(self.put(lines))
+        self.assertIsNone(reason)
+        return [text for text, _ in msgs]
+
+    def test_AH1_incident_delivered_after_write_fails(self):
+        self.put(self.lines[:CUT_DELIVERED])
+        proc = self.gate(self.text)
+        self.assertFailsWith(proc, '[FAIL] 2 user message(s) after the last /handoff are not in "After Handoff":')
+        self.assertIn(f"\n  - 「{M1}」 (06:54:07Z)\n", proc.stdout)
+        self.assertIn(f"\n  - 「{M2}」 (06:55:19Z)\n", proc.stdout)
+        self.assertNotIn("(06:55:46Z)", proc.stdout)  # the enqueue time, not the delivery record's
+        self.assertNotIn("[PASS]", proc.stdout)
+
+    def test_AH1b_queued_message_with_image_counts(self):
+        said = "Ship the screenshot fix first."
+        self.put(self.lines[:CUT_BEFORE] + [queued_rec(image_prompt(said), enqueued="2026-11-09T06:55:42.000Z")])
+        proc = self.gate(self.text)
+        self.assertFailsWith(proc, '[FAIL] 1 user message(s) after the last /handoff are not in "After Handoff":')
+        self.assertIn(f"\n  - 「{said}」 (06:55:42Z)\n", proc.stdout)
+        self.assertPasses(self.gate(self.with_after(said)))
+
+    def test_AH2_undelivered_enqueue_not_counted(self):
+        self.put(self.lines[:CUT_BEFORE])
+        proc = self.gate(self.text)
+        self.assertPasses(proc)
+        self.assertNotIn("/handoff", proc.stdout)
+        self.assertNotIn("WARNING", proc.stdout)
+
+    def test_AH3_reconciled_passes(self):
+        self.put(self.lines[:CUT_DELIVERED])
+        proc = self.gate(self.with_after(M1, M2))
+        self.assertPasses(proc)
+        self.assertTrue(proc.stdout.startswith("[PASS]"), proc.stdout)
+
+    def test_AH3b_quoted_in_another_section_fails(self):
+        self.put(self.lines[:CUT_DELIVERED])
+        notes = "".join(f"- 「{q}」 → 결정: 변경 없음\n" for q in (M1, M2))
+        text = self.text.rstrip("\n") + f"\n\n## Notes\n\n{notes}\n## After Handoff\n\n- 「다른 줄」 → 결정: 변경 없음\n"
+        self.assertFailsWith(self.gate(text), '[FAIL] 2 user message(s) after the last /handoff are not in "After Handoff":')
+
+    def test_AH4_full_transcript(self):
+        self.put(self.lines[:FULL])
+        self.assertPasses(self.gate(self.with_after(M1, M2, A1)))
+
+    def test_AH18_dialog_answer_counts(self):
+        self.put(self.lines[:FULL])
+        proc = self.gate(self.with_after(M1, M2))
+        self.assertFailsWith(proc, '[FAIL] 1 user message(s) after the last /handoff are not in "After Handoff":')
+        self.assertIn(f"\n  - 「{A1}」 (06:56:30Z)\n", proc.stdout)
+        self.assertNotIn(M1, proc.stdout)
+        self.assertPasses(self.gate(self.with_after(M1, M2, A1)))
+
+    def test_AH18b_answer_quoted_only_inside_another_line_fails(self):
+        self.put(self.lines[:FULL])
+        text = self.with_after(M1).rstrip("\n") + f"\n- 「{M2}」 → 결정: 「{A1}」 답과 같다\n"
+        proc = self.gate(text)
+        self.assertFailsWith(proc, '[FAIL] 1 user message(s) after the last /handoff are not in "After Handoff":')
+        self.assertIn(f"\n  - 「{A1}」 (06:56:30Z)\n", proc.stdout)
+
+    def test_AH5_match_rule(self):
+        def left(msg, section):
+            return [t for t, _ in self.mod.unrecorded([(msg, "2026-11-09T07:00:00.000Z")], section)]
+        respaced = "- 「Move part C to the\n  second   round and\tship A and B first.」 → 결정: C를 미룸"
+        self.assertEqual(left(M1, respaced), [])
+        self.assertEqual(left(M1, f"- 「{M1[:39]}」 → 결정: 변경 없음"), [M1])  # 39 characters are not enough
+        self.assertEqual(left(M1, f"- 「{M1[:40]}… 」 → 결정: 변경 없음"), [])  # 40 are
+        self.assertEqual(left(M1, "- 「다른 줄」 → 결정: " + M1), [M1])  # the quote opens with 「
+        self.assertEqual(left("A", "- 「「A」안은 버리고 「B」안으로 가자.」 → 결정: B안"), ["A"])  # nested: no line
+        self.assertEqual(left("계속", f"- 「{M1}」 → 결정: 「계속」으로 진행"), ["계속"])
+        self.assertEqual(left("A", "  - 「A」 → 결정: 변경 없음"), [])  # an indented item still opens one
+        twins = [(M1 + " Then C.", "2026-11-09T07:00:00.000Z"), (M1 + " Then D.", "2026-11-09T07:01:00.000Z")]
+        self.assertEqual(self.mod.unrecorded(twins, f"- 「{M1}」 → 결정: 변경 없음"), twins[1:])  # one quote each
+        self.assertEqual(left(A1, f"- 「{A1}」 → 결정: 변경 없음"), [])
+        self.assertEqual(left(A1, f"- 「{A1}, maybe」 → 결정: 변경 없음"), [A1])  # a short message is quoted whole
+        self.assertEqual(left("ok", "- 「Ship it after the review」 → 결정: ok로 둔다"), ["ok"])
+        self.assertEqual(left("ok", "- 「ok」 → 결정: 변경 없음"), [])
+        self.assertEqual(left(M2, f"- 「{unicodedata.normalize('NFD', M2)}」 → 결정: 변경 없음"), [])
+        self.assertNotEqual(unicodedata.normalize("NFD", M2), M2)
+
+    def test_AH6_classifier_table(self):
+        c, h = self.mod.classify_record, {"kind": "human"}
+        cmd = "<command-message>handoff</command-message>\n<command-name>/handoff</command-name>"
+        def user(content, **kw):
+            return {"type": "user", "message": {"role": "user", "content": content}, **kw}
+        def skill(name):
+            return {"type": "assistant", "message": {"content": [{"type": "text", "text": "x"},
+                    {"type": "tool_use", "name": "Skill", "input": {"skill": name}}]}}
+        def answer(answers, **kw):
+            return user([{"type": "tool_result", "tool_use_id": "t", "content": "answered"}],
+                        toolUseResult={"answers": answers}, **kw)
+        def att(prompt, kind="human", typ="queued_command"):
+            return {"type": "attachment", "attachment": {"type": typ, "prompt": prompt, "origin": {"kind": kind}}}
+        pasted = "/Us" + "ers/x/y.md 고쳐"  # a pasted path is a message (assembled: the public scan rejects the literal)
+        rows = {
+            "user /handoff command": (user(cmd, origin=h), "baseline"),
+            "user /handoff command, text blocks, no origin": (user([{"type": "text", "text": "  " + cmd}]), "baseline"),
+            "Skill handoff": (skill("handoff"), "baseline"),
+            "Skill plugin:handoff": (skill("demo-tools:handoff"), "baseline"),
+            "Skill resume-handoff": (skill("resume-handoff"), None),
+            "Skill other": (skill("handoff-notes"), None),
+            "assistant text only": ({"type": "assistant", "message": {"content": [{"type": "text", "text": cmd}]}}, None),
+            "isMeta /handoff command": (user(cmd, origin=h, isMeta=True), None),
+            "isMeta text": (user("Base directory for this skill", origin=h, isMeta=True), None),
+            "promptSource system": (user("hello", origin=h, promptSource="system"), None),
+            "dialog answer": (answer({"q1": "값1", "q2": "값2"}), "message"),
+            "dialog answer, list and other values": (answer({"q1": ["a", "b"], "q2": 3, "q3": "c"}), "message"),
+            "dialog answers empty dict": (answer({}), None),
+            "dialog answers a string": (answer("값1"), None),
+            "dialog answers with an empty body": (answer({"q1": 3, "q2": ""}), None),
+            "dialog answer blank": (answer({"q": "  "}), None),
+            "no origin": (user("Another session reports"), None),
+            "origin a string": (user("hello", origin="human"), None),
+            "origin peer": (user("hello", origin={"kind": "peer"}), None),
+            "tool_result only": (user([{"type": "tool_result", "content": "x"}], origin=h), None),
+            "bash tag": (user("<bash-input>ls</bash-input>", origin=h), None),
+            "local command tag": (user("  <local-command-stdout>x</local-command-stdout>", origin=h), None),
+            "other command": (user("<command-name>/clear</command-name>", origin=h), None),
+            "empty": (user("", origin=h), None),
+            "blank": (user("  \n ", origin=h), None),
+            "pasted path": (user(pasted, origin=h), "message"),
+            "xml start": (user("<note>keep this</note>", origin=h), "message"),
+            "text blocks": (user([{"type": "text", "text": "keep D"}], origin=h), "message"),
+            "queued slash": (att("/review now"), "message"),
+            "queued text and image": (att(image_prompt("keep D")), "message"),
+            "queued image only": (att(image_prompt("")[1:]), None),
+            "queued task notification": (att("<task-notification>x</task-notification>", kind="task-notification"), None),
+            "queued empty": (att(""), None),
+            "other attachment": (att("x", typ="total_tokens_reminder"), None),
+            "attachment null": ({"type": "attachment", "attachment": None}, None),
+            "queue operation": ({"type": "queue-operation", "operation": "enqueue", "content": "x"}, None),
+            "system": ({"type": "system", "content": "x"}, None),
+            "meta record": ({"type": "last-prompt", "lastPrompt": "x"}, None),
+        }
+        for name, (rec, want) in rows.items():
+            with self.subTest(row=name):
+                self.assertEqual(c(rec), want)
+        self.assertEqual(self.mod.record_text(rows["dialog answer"][0]), "값1 / 값2")
+        self.assertEqual(self.mod.record_text(rows["dialog answer, list and other values"][0]), "a, b / c")
+        self.assertEqual(self.mod.record_text(rows["pasted path"][0]), pasted)
+        self.assertEqual(self.mod.record_text(rows["queued slash"][0]), "/review now")
+        self.assertEqual(self.mod.record_text(rows["queued text and image"][0]), "keep D")
+
+    def test_AH7_baseline_reset_by_user(self):
+        lines = self.lines[:CUT_DELIVERED]
+        self.assertEqual(self.texts(lines[:28] + [lines[15]] + lines[28:]), [M2])
+
+    def test_AH7b_baseline_by_skill_tool_use(self):
+        lines = self.lines[:CUT_DELIVERED]
+        self.assertEqual(self.texts(lines[:28] + [lines[5]] + lines[28:]), [M2])
+
+    def test_AH7c_last_of_both_wins(self):
+        lines, between = self.lines[:CUT_DELIVERED], user_rec("Typed between the two baselines.")
+        self.assertEqual(self.texts(lines), [M1, M2])
+        self.assertEqual(self.texts(lines[:13] + [between] + lines[13:]), [M1, M2])  # line 16 is the baseline
+        self.assertEqual(self.texts(lines[:13] + [between] + lines[16:]),  # without it, line 6 is
+                         ["Typed between the two baselines.", M1, M2])
+
+    def test_AH8_position_not_time(self):
+        lines = self.lines[:CUT_DELIVERED]
+        early = queued_rec("Enqueued before, delivered after.", enqueued="2026-11-09T06:30:00.000Z")
+        late = queued_rec("Delivered before the baseline.", enqueued="2026-11-09T07:30:00.000Z")
+        self.assertEqual(self.texts(lines[:13] + [late] + lines[13:16] + [early] + lines[16:]),
+                         ["Enqueued before, delivered after.", M1, M2])
+
+    def test_AH9_each_occurrence(self):
+        lines = self.lines[:CUT_DELIVERED] + [user_rec(M1, promptSource="queued"), user_rec(f" {M1}\n")]
+        self.assertEqual(self.texts(lines), [M1, M2, M1, M1])
+
+    def test_AH9b_same_answer_twice_needs_two_quotes(self):
+        self.put(self.lines[:CUT_DELIVERED] + [user_rec("yes"), user_rec("yes", ts="2026-11-09T07:05:00.000Z")])
+        proc = self.gate(self.with_after(M1, M2, "yes"))
+        self.assertFailsWith(proc, '[FAIL] 1 user message(s) after the last /handoff are not in "After Handoff":')
+        self.assertIn("\n  - 「yes」 (07:05:00Z)\n", proc.stdout)
+        self.assertNotIn("(07:00:00Z)", proc.stdout)
+        proc = self.gate(self.with_after(M1, M2))
+        self.assertFailsWith(proc, "[FAIL] 2 user message(s)", "\n  - 「yes」 (07:00:00Z)\n  - 「yes」 (07:05:00Z)\n")
+        self.assertEqual(self.record()["fail_codes"], {"after-handoff": 2})
+        self.assertPasses(self.gate(self.with_after(M1, M2, "yes", "yes")))
+
+    def test_AH9c_dialog_answer_and_typed_same_text(self):
+        self.put(self.lines[:FULL] + [user_rec(A1)])
+        proc = self.gate(self.with_after(M1, M2, A1))
+        self.assertFailsWith(proc, '[FAIL] 1 user message(s) after the last /handoff are not in "After Handoff":')
+        self.assertIn(f"\n  - 「{A1}」 (07:00:00Z)\n", proc.stdout)
+        self.assertNotIn("(06:56:30Z)", proc.stdout)
+        self.assertPasses(self.gate(self.with_after(M1, M2, A1, A1)))
+
+    def test_AH10_degrade(self):
+        def warned(proc, reason):
+            self.assertPasses(proc)
+            self.assertEqual(proc.stdout.splitlines()[-1], f"WARNING: after-handoff messages not checked: {reason}")
+            self.assertNotIn("Traceback", proc.stderr)
+        warned(self.gate(self.text), "transcript not found")
+        self.put([self.lines[i] for i in (0, 1, 5, 7, 12)])  # no user record with an origin
+        warned(self.gate(self.text), "transcript format unknown")
+        self.put(self.lines[:5])
+        warned(self.gate(self.text), "no /handoff input in transcript")
+        malformed = ['{"type": "user", "origin": "human", "message": {"content": "x"}}',
+                     '{"type": "user", "origin": {"kind": "human"}, "message": {"content": ["a string", 3]}}',
+                     '{"type": "attachment", "attachment": null}', '{"type": "user", "origin": {"kind": "human"}}',
+                     '{"type": "user", "origin": {"kind": "human"}, "message": "a string"}', '["user"]',
+                     '{"type": "assistant", "message": {"content": "a string"}}', '{"type": "user", "isMeta": "x"}']
+        self.put(self.lines[:16] + malformed + self.lines[16:CUT_DELIVERED])
+        proc = self.gate(self.with_after(M1, M2))
+        self.assertPasses(proc)
+        self.assertNotIn("Traceback", proc.stderr)
+        broken = ['{"type": "user", "origin"', "{not json", '"user"', ""]
+        self.assertEqual(self.texts(self.lines[:16] + broken + self.lines[16:CUT_DELIVERED]), [M1, M2])
+        path = self.put(self.lines[:CUT_DELIVERED])
+        with mock.patch.object(self.mod, "classify_record", side_effect=TypeError("boom")):
+            self.assertEqual(self.mod.messages_after_handoff(path), ([], "transcript format unknown"))
+        with mock.patch.object(self.mod, "TRANSCRIPT_MAX_BYTES", 10):
+            self.assertEqual(self.mod.messages_after_handoff(path), ([], "transcript too large"))
+        path.unlink()
+        path.mkdir()  # found by name, but not a file
+        warned(self.gate(self.text), "transcript unreadable")
+
+    def test_AH11_session_header(self):
+        self.put(self.lines[:CUT_DELIVERED])
+        want = f"**Session:** must be this session's id {SID}"
+        for name, text in (("missing", self.base), ("other id", self.text.replace(SID, "11111111-1111-4111-8111-111111111111"))):
+            with self.subTest(case=name):
+                proc = self.gate(self.with_after(M1, M2, text=text))
+                self.assertFailsWith(proc, "resume-contract problem(s):", want)
+                self.assertEqual(self.record()["fail_codes"], {"contract-session": 1})
+        top, prev = "relative/top", "relative/prev"
+        broken = self.base.replace("**Toplevel:** /home/u/sample-project", f"**Toplevel:** {top}", 1)
+        proc = self.gate(self.with_after(M1, M2, text=broken.replace("**Continues:** none", f"**Continues:** {prev}", 1)))
+        order = [f"  - **Toplevel:** is not an absolute path: {top}",
+                 f"  - **Continues:** is neither none nor an absolute path: {prev}", f"  - {want}"]
+        self.assertEqual([ln for ln in proc.stdout.splitlines() if ln in order], order)  # contract-session is third
+        proc = self.gate(self.base, HANDOFF_CALLER="handoff_state.py")
+        self.assertPasses(proc)
+        self.assertNotIn("Session:", proc.stdout)
+        self.assertNotIn("/handoff", proc.stdout)
+
+    def test_AH12_no_env_unchanged(self):
+        folder = self.tmp / "base"
+        folder.mkdir()
+        for name in ("check_handoff.py", "run_log.py"):
+            proc = subprocess.run(["git", "show", f"{GATE_BASE}:scripts/{name}"], cwd=ROOT, capture_output=True)
+            if proc.returncode != 0:
+                self.skipTest(f"base commit {GATE_BASE} is not available")
+            (folder / name).write_bytes(proc.stdout)
+        self.put(self.lines[:CUT_DELIVERED])  # a transcript that would fail the gate
+        def run(script, path, **extra):
+            return subprocess.run([sys.executable, str(script), str(path), "--git", "yes"], capture_output=True,
+                                  text=True, encoding="utf-8", env=self.env(HANDOFF_LOG="off", **extra))
+        for fixture in (VALID, TEMPLATE, PREVIOUS):
+            old = run(folder / "check_handoff.py", fixture)
+            for name, extra in (("no env", {}), ("not a uuid", {"CLAUDE_CODE_SESSION_ID": "not-a-uuid"}),
+                                ("resume caller", {"CLAUDE_CODE_SESSION_ID": SID, "HANDOFF_CALLER": "handoff_state.py"})):
+                with self.subTest(fixture=fixture.name, case=name):
+                    new = run(CHECKER, fixture, **extra)
+                    self.assertEqual((new.returncode, new.stdout), (old.returncode, old.stdout))
+
+    def test_AH13_fail_codes_and_privacy(self):
+        self.put(self.lines[:CUT_DELIVERED])
+        self.gate(self.text)
+        self.assertEqual(self.record()["fail_codes"], {"after-handoff": 2})
+        self.assertGreaterEqual(self.record()["omitted_lines"], 2)
+        raw = (self.tmp / "runs.jsonl").read_text(encoding="utf-8")
+        for text in (raw, json.dumps([json.loads(x) for x in raw.splitlines()], ensure_ascii=False)):
+            self.assertNotIn(M1[:20], text)
+            self.assertNotIn(M2[:10], text)
+
+    def test_AH14_secret(self):
+        said = f"Push with {TOKEN} to the demo remote."
+        self.put(self.lines[:17] + [user_rec(said)])
+        proc = self.gate(self.text)
+        self.assertFailsWith(proc, "Push with REDACTED to the demo remote.")
+        self.assertNotIn(TOKEN, proc.stdout + proc.stderr)
+        self.assertNotIn(TOKEN, (self.tmp / "runs.jsonl").read_text(encoding="utf-8"))
+        proc = self.gate(self.with_after(said))
+        self.assertFailsWith(proc, "secret-like value (GitHub token)")
+        self.assertEqual(self.record()["fail_codes"], {"secret:github-token": 1})
+        self.assertNotIn(TOKEN, proc.stdout)
+        self.assertPasses(self.gate(self.with_after(said.replace(TOKEN, "REDACTED"))))
+
+    def test_AH15_caps(self):
+        long = "word " * 100  # 500 characters
+        said = [long] + [f"Message number {n} for the cap test." for n in range(2, 8)]
+        self.put(self.lines[:17] + [user_rec(s) for s in said])
+        proc = self.gate(self.text)
+        self.assertFailsWith(proc, "[FAIL] 7 user message(s) after the last /handoff")
+        shown = [ln for ln in proc.stdout.splitlines() if ln.startswith("  - 「")]
+        self.assertEqual(len(shown), 5)
+        self.assertEqual(shown[0], "  - 「" + " ".join(long.split())[:300] + "…」 (07:00:00Z)")
+        self.assertIn("\n  - … and 2 more\n", proc.stdout)
+        self.assertEqual(self.record()["fail_codes"], {"after-handoff": 7})
+
+    def test_AH16_codes_and_regex(self):
+        self.assertIn("after-handoff", self.mod.FAIL_CODES)
+        self.assertIn("contract-session", self.mod.FAIL_CODES)
+        spec = importlib.util.spec_from_file_location("run_log_ah16", ROOT / "scripts" / "run_log.py")
+        run_log = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(run_log)
+        self.assertEqual(self.mod.SESSION_ID.pattern, run_log.SESSION_ID.pattern)
+
+    def test_AH17_find_transcript(self):
+        self.assertIsNone(self.mod.find_transcript("not-a-uuid"))
+        with mock.patch.dict(os.environ, {"HOME": str(self.home), "USERPROFILE": str(self.home)}):
+            self.assertIsNone(self.mod.find_transcript(SID))
+            first = self.put(self.lines[:5])
+            second = self.home / ".claude" / "projects" / "-tmp-other" / f"{SID}.jsonl"
+            second.parent.mkdir(parents=True)
+            second.write_text("{}\n", encoding="utf-8", newline="\n")
+            os.utime(first, (1_000_000, 1_000_000))
+            self.assertEqual(self.mod.find_transcript(SID), second)  # the most recent copy
+            os.utime(second, (1_000_000, 1_000_000))
+            self.assertEqual(self.mod.find_transcript(SID), first)  # a tie: the first path
+            loop = self.home / ".claude" / "projects" / "-tmp-aaa" / f"{SID}.jsonl"
+            loop.parent.mkdir(parents=True)
+            loop.symlink_to(loop.name)  # a symlink loop: stat() fails on this candidate only
+            self.assertEqual(self.mod.find_transcript(SID), first)
+            gone = self.home / ".claude" / "projects" / "-tmp-gone" / f"{SID}.jsonl"
+            with mock.patch.object(self.mod.Path, "glob", lambda folder, pattern: iter([gone, first])):
+                self.assertEqual(self.mod.find_transcript(SID), first)  # a copy gone between glob and stat
 
 
 if __name__ == "__main__":

@@ -130,13 +130,14 @@ flowchart TD
 ### 핸드오프 파일 안의 구조
 | 부분 | 들어 있는 것 | 이어 쓸 때 |
 |---|---|---|
-| 머리 줄 | `**Project:**` · `**Toplevel:**`(프로젝트 판별용) · `**Continues:**` · `**Topic:**` | `Continues`에 이어받은 파일 경로. 처음이면 `none` |
+| 머리 줄 | `**Project:**` · `**Toplevel:**`(프로젝트 판별용) · `**Continues:**` · `**Session:**` · `**Topic:**` | `Continues`에 이어받은 파일 경로. 처음이면 `none`. `Session`에 이 세션의 id, 없으면 `none` |
 | `## Confidence` | `high` · `medium` · `low` | 매번 새로 정한다 |
 | `## Session State` | 브랜치 · HEAD · 바뀐 파일 · Live 3필드(`Live subagents`·`Live runners`·`Live scheduled`) | 미해결 Live 항목은 옮기거나 이력 파일로 닫는다 |
 | `## Goal (carried)` | `Origin` · `Goal` · `Done-when` · `Constraints` · `Changes` | 그대로 복사한다. 사용자가 바꾸라고 했을 때만 고친다. `Constraints`는 새 항목을 `; `로 이어 붙이는 것만 자유다. 기존 항목은 그대로 둔다. `none`은 항목 0개다 |
 | 작업 기록 절 | 무엇을 만드는지 · 된 것 · 안 된 것 · 버린 가설 · 아직 안 해 본 것 · 파일 상태 · 결정(`What`·`Why`·`How` 표) · 막힌 것 | 끝났고 이후 단계가 쓰지 않는 것은 이력 파일로 옮긴다. 안 된 것과 버린 가설은 남긴다 |
 | `## Closed (pointers)` | 이력 파일 경로와 닫은 항목 키 | 닫은 항목이 있을 때만 |
 | `## Exact Next Step` | 다음 세션이 처음 할 일 | 매번 새로 쓴다 |
+| `## After Handoff` | `/handoff`가 시작된 뒤 사용자 메시지마다 1줄(선택, 항상 맨 끝) | 브리핑에서 먼저 읽는다. 본문에 다시 쓰지 않는다 |
 
 ## 역할
 - `/handoff`는 세션이 아는 것을 날짜가 붙은 파일 하나로 `~/.claude/handoffs/`에 쓴다. 돌고 있는 작업은 멈추지 않는다.
@@ -204,6 +205,17 @@ flowchart TD
 - `/handoff`는 이력 파일에 줄을 덧붙이기만 한다. 기존 줄을 지우거나 고치지 않는다.
 - `/resume-handoff`는 이력 파일을 기본으로 읽지 않는다. 열린 항목의 `how`가 이력 키를 가리킬 때만 읽는다.
 - 핸드오프가 이력 파일을 가리키는 방법은 `## Closed (pointers)` 절 1줄이다.
+
+### After Handoff
+`/handoff`가 시작된 뒤 사용자가 준 결정은 핸드오프 본문에 없다. 게이트 두 개가 이를 잃지 않게 한다.
+
+- 핸드오프 파일에는 머리 줄 `**Session:** <id>`(`/handoff` Step 0에서 `handoff_state.py`가 출력하는 `session id:` 줄 값, 없으면 `none`)와 맨 끝 선택 절 `## After Handoff`가 있다. `/handoff`가 시작된 뒤 사용자 메시지는 입력했든 대기열에 있었든 질문 창 답이든 모두 이 절에 1줄씩 적는다: `- 「<사용자 원문>」 → 결정: <무엇을 어떻게 바꿨나>`. `→ 결정: 변경 없음`도 1줄이다. 본문은 다시 쓰지 않으며, 본문과 어긋나면 이 절이 우선한다.
+- 쓰는 쪽 게이트: `CLAUDE_CODE_SESSION_ID`가 UUID이면 `check_handoff.py`가 이 세션의 전사를 읽는다. 마지막 `/handoff` 뒤 사용자 메시지가 절에 실려 있지 않으면(줄마다 `- 「`로 시작하고, 다른 줄 안에 든 인용은 세지 않는다) `after-handoff`로 exit 1이고 빠진 메시지를 원문 그대로 최대 5줄 출력한다. `**Session:**`이 없거나 이 세션의 id가 아니면 `contract-session`으로 exit 1이다. 다른 세션에서 옛 파일을 손으로 검사할 때는 `env -u CLAUDE_CODE_SESSION_ID python3 ~/.claude/scripts/check_handoff.py <파일> --git yes|no`로 실행한다.
+- 재개 게이트: 파일의 `**Session:**`이 UUID이면 `handoff_state.py --resume`이 그 전사를 다시 읽는다. 절에 실리지 않은 메시지가 있으면 `--c`여도 `continue: no (unrecorded messages after handoff)`가 되고, `WARNING: N user message(s) after the last /handoff are not in the handoff file`와 메시지마다 들여쓴 1줄을 출력한다. `project mismatch`와 `newer handoff skipped`가 이 이유보다 먼저이지만 WARNING은 어느 쪽이든 나온다. 브리핑은 `AFTER HANDOFF:` 블록으로 시작한다. 진행하려면 사용자는 옛 세션으로 돌아가(`claude --resume <**Session:** id>`) 빠진 줄을 `## After Handoff`에 덧붙이고 검사기를 다시 실행하거나, 새 세션에서 `계속`이라고 말한다. `계속`이면 빠진 메시지를 최신 결정으로 보고 먼저 반영한다.
+- 판독 실패 때: 전사가 없거나 읽을 수 없거나 너무 크거나 형식을 모르거나 `/handoff` 입력이 없으면 두 게이트 모두 `WARNING: after-handoff messages not checked: <이유>`를 출력한다. 종료 코드와 `continue:`는 바뀌지 않는다. `**Session:**`이 없거나 `none`인 파일은 재개 때 검사하지 않는다.
+- 출력 계약: 세션 변수가 UUID이면 `handoff_state.py` 기본 모드가 `session id: <uuid>`와 `transcript: <경로 | none (not found)>` 2줄을 더 출력하므로 기본 출력은 25줄 대신 최대 27줄이다. 변수가 없으면 출력은 그대로다.
+- `run_report.py`는 새 경고 종류 2개 `after-handoff messages not checked`와 `user messages after the last /handoff not in the handoff file`를 센다. 새 실패 코드 2개는 `fail_codes`에서 센다.
+- 받아들인 한계: 게이트는 사용자 메시지만 비교한다. 입력되지 않은 결정이나 `/handoff` 실행 전에 세션이 파일에서 빠뜨린 결정은 잡지 못한다.
 
 ## 실행 기록
 - 두 스크립트는 실행마다 JSON 1줄을 `~/.claude/handoffs/.state/runs.jsonl`에 덧붙인다. 핸드오프 파일의 본문은 기록하지 않고 경로만 기록한다.

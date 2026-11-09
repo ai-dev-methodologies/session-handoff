@@ -376,6 +376,33 @@ class HandoffDocTests(Base):
         self.matches(r"(?is)`values`[^.]{0,200}(only|just)[^.]{0,120}Step 5", step6)
         self.matches(r"(?is)checker[^.]{0,80}(does not|never) read", step6)
 
+    def test_AH30_handoff_doc(self):
+        fmt = self.text.split("## Session File Format", 1)[1]
+        self.has("**Session:** [", fmt)
+        self.assertLess(fmt.index("**Continues:**"), fmt.index("**Session:**"))
+        self.assertLess(fmt.index("**Session:**"), fmt.index("**Topic:**"))
+        self.has("## After Handoff", fmt)
+        self.has("→ 결정:", fmt)
+        self.has("결정: 변경 없음", self.text)
+        self.assertGreater(fmt.index("## After Handoff"), fmt.index("## Environment & Setup Notes"))
+        step0 = self._step(0)
+        self.has("`session id:`", step0)
+        self.has("`transcript:`", step0)
+        step2 = self._step(2)
+        self.matches(r"(?s)`transcript:`.{0,200}(folder|directory).{0,200}subagents/agent-<id>\.jsonl", step2)
+        step6 = self._step(6)
+        self.has("after-handoff", step6)
+        self.matches(r"(?is)append[^.]{0,120}`## After Handoff`", step6)
+        self.has("env -u CLAUDE_CODE_SESSION_ID", step6)
+        self.matches(r"(?is)final reply[^.]{0,80}(not|never)[^.]{0,120}(differs|differ)", self.text)
+        self.matches(r"(?is)`## After Handoff` holds user\s+messages only", step6)
+        self.has("not ready — unmaskable secret in a message", self.text)
+        self.matches(r"(?is)never Write the whole file", step6)
+        self.matches(r"(?is)only exception\s+to the \"exits 0\" rule; never run `/handoff` again to clear it", self.text)
+        self.matches(r"(?is)do not report until it exits 0 \(the one exception: an unmaskable secret", step6)
+        self.matches(r"(?is)run `/handoff` again \(never to\s+clear an after-handoff failure", step6)
+        self.matches(r"(?is)not quoted in `## After Handoff` \(each line opens\s+with `- 「`", step6)
+
 
 class ResumeDocTests(Base):
     @classmethod
@@ -474,7 +501,7 @@ class ResumeDocTests(Base):
 
     def test_C6_briefing_order_goal_then_questions_then_live_work(self):
         block = self._briefing_block()
-        order = ["GOAL (carried):", "BLOCKERS / OPEN QUESTIONS:", "LIVE WORK:", "OPEN WORK:",
+        order = ["AFTER HANDOFF:", "GOAL (carried):", "BLOCKERS / OPEN QUESTIONS:", "LIVE WORK:", "OPEN WORK:",
                  "DECIDED (do not relitigate):", "DO NOT RETRY:", "NEXT STEP:"]
         pos = [block.find(w) for w in order]
         self.assertTrue(all(i >= 0 for i in pos), f"missing heading: {pos}")
@@ -578,6 +605,38 @@ class ResumeDocTests(Base):
         self.matches(r"`Constraints`[^\n]*verbatim", goal)
         self.assertLess(goal.index("`Done-when`"), goal.index("`Constraints`"))
         self.assertLess(goal.index("`Constraints`"), goal.index("What We Are Building"))
+
+    def test_AH31_resume_doc(self):
+        def steps_0_3(text):
+            return text.split("#### What Steps 0–3 do", 1)[1].split("### Step 1", 1)[0]
+
+        base = subprocess.run(["git", "show", "1c6bbeb:commands/resume-handoff.md"], cwd=ROOT,
+                              capture_output=True)
+        if base.returncode != 0:
+            self.skipTest("commit 1c6bbeb is not available")
+        self.assertEqual(steps_0_3(base.stdout.decode("utf-8")).encode("utf-8"),
+                         steps_0_3(self.text).encode("utf-8"))
+        block = self._briefing_block()
+        self.assertLess(block.index("AFTER HANDOFF:"), block.index("GOAL (carried):"))
+        step1 = self.text.split("### Step 1", 1)[1].split("### Step 2", 1)[0]
+        self.matches(r"(?s)project mismatch.{0,12}>.{0,12}newer handoff skipped.{0,12}>.{0,12}unrecorded messages after handoff", step1)
+        rows = [r for r in self._table_rows() if r.lstrip().startswith("| `continue: no`")]
+        self.assertTrue(rows)
+        self.has("continue: no (unrecorded messages after handoff)", rows[0])
+        step5 = self.text.split("### Step 5", 1)[1].split("## Warnings", 1)[0]
+        self.matches(r"(?is)unrecorded messages after handoff.{0,400}`claude --resume <the \*\*Session:\*\* id>`"
+                     r".{0,200}append only.{0,200}checker", step5)
+        self.matches(r"(?is)계속」 here, the unrecorded lines are the latest\s+decisions.{0,120}before Exact Next Step"
+                     r".{0,120}it wins", step5)
+        self.matches(r"(?is)Whenever the `AFTER HANDOFF:` block ends with `… and N more`, do not continue, whatever the"
+                     r"\s+`continue:` reason", step5)
+        notes = self.text.split("\n## Notes", 1)[1]
+        self.matches(r"(?is)`## After Handoff` lines are the user's decisions \(Step 4\) and apply once the session"
+                     r"\s+continues", notes)
+        self.assertNotIn("go on without them", step5)
+        warnings = self.text.split("## Warnings to include in the briefing", 1)[1].split("\n## ", 1)[0]
+        self.has("not in the handoff file", warnings)
+        self.has("after-handoff messages not checked", warnings)
 
 
 class ReadmeKoTests(Base):
@@ -990,6 +1049,16 @@ class RunReportDocTests(unittest.TestCase):
         first = re.search(r"(?m)^## \[([^\]]+)\]", read(CHANGELOG))
         self.assertIsNotNone(first, "no version heading")
         self.assertEqual(mod.VERSION, first.group(1))
+
+    def test_AH32_readmes_changelog(self):
+        for name, text in (("README.md", self.en), ("README.ko.md", self.ko)):
+            for needle in ("After Handoff", "after-handoff", "contract-session", "**Session:**",
+                           "session id:", "transcript:", "after-handoff messages not checked"):
+                self.assertIn(needle, text, f"{name} lacks {needle}")
+        change = read(CHANGELOG).split("## [2026.11.09-3]", 1)
+        self.assertEqual(2, len(change), "CHANGELOG lacks 2026.11.09-3")
+        self.assertIn("after-handoff", change[1].split("\n## [", 1)[0])
+        self.assertTrue(read(CHANGELOG).split("## [", 1)[1].startswith("2026.11.09-3]"))
 
     def test_R9_report_call_only_in_notes(self):
         resume_notes = self.resume.split("\n## Notes", 1)[1]
