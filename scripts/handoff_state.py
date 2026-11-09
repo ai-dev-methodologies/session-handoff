@@ -41,6 +41,14 @@ with `--c`. A `project mismatch` or `newer handoff skipped` reason wins over it,
 When the transcript cannot be judged, `WARNING: after-handoff messages not checked: <reason>` takes that
 place and `continue:` is unchanged. A file without the line, or with `none`, prints neither.
 
+That transcript also gives the BEFORE block, printed after those lines and before `handoff age:`:
+`before handoff: N user message(s)` and one indented `「<message>」 (HH:MM:SSZ)` line per message the user gave
+right before the last /handoff input (the last 5, plus the input's arguments; at most 6). A
+`WARNING: N user message(s) before the last /handoff are not in the handoff file` follows when the file's
+`## Before Handoff` does not record them all. The block is display only: `continue:` stays what the after-handoff
+messages decide, and a checker without these functions prints `checker unavailable` in the not-checked WARNING.
+In the default mode the run record's `handoff` field is the `previous handoff:` path.
+
 In the default mode, when ~/.claude/scripts/context_budget.py exists, its `--line` output is
 printed as `context-budget: <first line, cut to 200 chars>`. Exit 0 and 2 both count as output
 (2 means over budget); any other exit code or empty output prints a `WARNING: context-budget ...`
@@ -129,6 +137,10 @@ RETURNED_STOPS = ("end_turn", "stop_sequence", "max_tokens", "refusal")
 NAME_ID_RE = re.compile(r"\(([^()]*)\)\s*$")
 ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 PROJECTS_DIR = HOME / ".claude" / "projects"
+LEAN_FILE = HOME / ".claude" / "state" / "lean-mode.json"
+LEAN_SINCE = re.compile(
+    r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+    r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)")
 INTERNAL_ERROR = 4
 OVERRIDE_POINTS = ("runner-completion", "state-files", "forbidden-writes", "values")
 OVERRIDE_RE = re.compile(r"^(?:" + "|".join(OVERRIDE_POINTS) + r")\s*(?::|$)")
@@ -144,6 +156,7 @@ SIZE_WARNING = "WARNING: handoff file is "
 SESSION_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")  # = run_log.SESSION_ID
 UNRECORDED = "no (unrecorded messages after handoff)"
 NOT_CHECKED_WARNING = "WARNING: after-handoff messages not checked:"
+BEFORE_SHOWN = 6  # the 5 messages before the last /handoff input plus its arguments
 RUN: dict = {}  # facts for the run log, filled while the script runs
 
 
@@ -236,6 +249,7 @@ def chain_lines() -> None:
     for warn in warns:
         print(warn)
     print(f"previous handoff: {previous if previous else 'none'}")
+    RUN["handoff"] = str(previous) if previous else None
     history = HANDOFF_DIR / "history" / f"{Path(RUN['project']).name}-{project_digest(RUN['project'])}.md"
     print(f"history file: {history} ({'exists' if history.is_file() else 'new'})")
 
@@ -336,6 +350,56 @@ def budget_line(cwd: Path) -> None:
         print(f"WARNING: context-budget gave no line (exit {proc.returncode})")
         return
     print(f"context-budget: {lines[0][:BUDGET_CHARS]}")
+
+
+def lean_project_matches(project) -> bool:
+    """True when the state file's `project` is this run's project key or a folder inside it (expanduser, then
+    check_handoff.path_key; the lean skill writes its cwd). Inside this run's toplevel counts too, so a linked
+    worktree the skill ran in matches when handoff_state runs there. `..` never matches."""
+    if not isinstance(project, str) or not project.strip():
+        return False
+    try:
+        value = path_key(str(Path(project).expanduser()))
+        if ".." in value.split("/"):
+            return False
+        for root in (RUN["project"], RUN.get("toplevel")):
+            key = path_key(root) if root else ""
+            if key and (value == key or value.startswith(key + "/")):
+                return True
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return False
+
+
+def lean_line() -> None:
+    """Print `lean-mode:` from the user's lean state file: nothing when the file is missing, `unknown` when it
+    cannot be read. Only `on`, `since` and `project` are read. `on` counts only for the project that set it
+    (`off (set for another project)` otherwise; the path is never printed), and `since` is printed only when
+    it is a strict UTC timestamp. Session scope is not implemented: the state file has no session field."""
+    try:
+        raw = LEAN_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        print("lean-mode: unknown")
+        return
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        data = None
+    on = data.get("on") if isinstance(data, dict) else None
+    if not isinstance(on, bool):
+        print("lean-mode: unknown")
+        return
+    since = data.get("since")
+    if not on:
+        print("lean-mode: off")
+    elif not lean_project_matches(data.get("project")):
+        print("lean-mode: off (set for another project)")
+    elif isinstance(since, str) and LEAN_SINCE.fullmatch(since):
+        print(f"lean-mode: on (since {since})")
+    else:
+        print("lean-mode: on")
 
 
 def session_lines() -> None:
@@ -515,25 +579,38 @@ def handoff_session(text: str) -> str | None:
     return None
 
 
-def after_handoff_lines(path: Path) -> tuple[bool, list[str]]:
-    """Resume gate: (some message the writing session got after its last /handoff is not quoted in the file,
-    the WARNING line and its indented quotes). Nothing for a file whose head names no session."""
+def handoff_gate_lines(path: Path) -> tuple[bool, list[str], list[str]]:
+    """Resume gates on the writing session's transcript: (some message the session got after its last /handoff is
+    not quoted in the file, the after-handoff WARNING line and its indented quotes, the BEFORE block: the
+    `before handoff:` line, the messages right before that /handoff, and a WARNING when the file's Before Handoff
+    does not record them all). Nothing for a file whose head names no session. The block is display only."""
     text = path.read_text(encoding="utf-8", errors="replace")
     sid = handoff_session(text)
     if sid is None:
-        return False, []
+        return False, [], []
     mod = checker_module()
     try:
-        missing, reason = mod.after_handoff_check(sid, text.split("\n"))
+        gates = mod.handoff_gates(sid, text.split("\n"))
+        reason, missing = gates["msg_reason"], gates["after"]
         shown = mod.shown_quotes(missing)
+        targets = []
+        if not reason and gates["before_lines"]:  # a second read: handoff_gates counts these messages but does not return them
+            got = mod.read_session(mod.find_transcript(sid))
+            targets = [mod.quote_line(msg, ts) for msg, _, ts in got["before"] + got["args"]][:BEFORE_SHOWN]
     except Exception:  # no checker, or one without the transcript functions (a mixed install)
-        missing, reason = [], "checker unavailable"
+        reason, missing, targets = "checker unavailable", [], []
     if reason:
-        return False, [f"{NOT_CHECKED_WARNING} {reason}"]
-    if not missing:
-        return False, []
-    head = f"WARNING: {len(missing)} user message(s) after the last /handoff are not in the handoff file"
-    return True, [head] + [f"  {ln}" for ln in shown]
+        return False, [f"{NOT_CHECKED_WARNING} {reason}"], []
+    after = []
+    if missing:
+        after = [f"WARNING: {len(missing)} user message(s) after the last /handoff are not in the handoff file"]
+        after += [f"  {ln}" for ln in shown]
+    before = []
+    if targets:
+        before = [f"before handoff: {gates['before_lines']} user message(s)"] + [f"  {ln}" for ln in targets]
+        if gates["before"]:
+            before.append(f"WARNING: {len(gates['before'])} user message(s) before the last /handoff are not in the handoff file")
+    return bool(missing), after, before
 
 
 def recorded_field(path: Path, label: str) -> str | None:
@@ -693,7 +770,7 @@ def resume_block(args: list[str], branch: str | None, in_git: bool) -> int:
         key, shown = handoff_project(path.read_text(encoding="utf-8", errors="replace"))
         if key != path_key(RUN["project"]):
             mismatch = shown or "unknown"
-    unrecorded, gate = after_handoff_lines(path) if path is not None else (False, [])
+    unrecorded, gate, before = handoff_gate_lines(path) if path is not None else (False, [], [])
     if mismatch:
         RUN["continue"] = "no (project mismatch)"
     elif skipped:
@@ -716,7 +793,7 @@ def resume_block(args: list[str], branch: str | None, in_git: bool) -> int:
     print(f"handoff: {path}")
     if mismatch:
         print(f"WARNING: handoff project differs: {mismatch}")
-    for ln in gate:
+    for ln in gate + before:
         print(ln)
     age_days = (time.time() - path.stat().st_mtime) / 86400
     warn = "  WARNING: handoff is older than 7 days" if age_days > OLD_DAYS else ""
@@ -746,8 +823,10 @@ def main(argv: list[str]) -> int:
     in_git, branch = state_block(cwd, with_diffstat=not resume)
     if not resume:
         session_lines()
+        lean_line()
         budget_line(cwd)
         return 0
+    lean_line()
     return resume_block(rest[1:], branch, in_git)
 
 

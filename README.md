@@ -136,7 +136,9 @@ The hash of the status file is made from the top-level folder path. The hash of 
 | `## Goal (carried)` | `Origin` · `Goal` · `Done-when` · `Constraints` · `Changes` | Copy as is. Change it only when the user says to. Only adding new items to the end of `Constraints`, separated by `; `, is free. Existing items stay as they are. `none` means zero items |
 | Work record sections | What we are building · what worked · what did not work · discarded hypotheses · what has not been tried · state of files · decisions (`What` · `Why` · `How` table) · blockers | Move what has ended and what later steps do not use to the history file. Keep what did not work and the discarded hypotheses |
 | `## Closed (pointers)` | The history file path and the keys of the closed items | Only when there are closed items |
+| `## Reviews` | One row per review run of the session (optional, right after the decisions) | Not carried over. Keep the conclusions in the decisions |
 | `## Exact Next Step` | What the next session does first | Written anew each time |
+| `## Before Handoff` | One line per user message right before `/handoff` and per argument of it (optional, right before `## After Handoff`) | Read in the briefing. Not rewritten into the body |
 | `## After Handoff` | One line per user message after `/handoff` started (optional, always last) | Read first in the briefing. Not rewritten into the body |
 
 ## Roles
@@ -212,12 +214,23 @@ The original goal and purpose, and the context still in progress, are kept acros
 A decision the user gives after `/handoff` starts is not in the file body. Two gates keep it from being lost.
 
 - The handoff file has a header line `**Session:** <id>` (the `session id:` line that `handoff_state.py` prints in `/handoff` Step 0, or `none`) and an optional last section `## After Handoff`. Each user message after `/handoff` starts, whether typed, queued, or a dialog answer, gets one line there: `- 「<user message verbatim>」 → 결정: <what changed and how>`. `→ 결정: 변경 없음` (“no change”) is also a line. The body is not rewritten, and this section wins where it differs from the body.
-- Writing gate: when `CLAUDE_CODE_SESSION_ID` is a UUID, `check_handoff.py` reads this session's transcript. It exits 1 with `after-handoff` when a user message after the last `/handoff` is not quoted in the section (each line opens with `- 「`; a quote nested inside another line does not count), and prints the missing messages verbatim (at most 5). It exits 1 with `contract-session` when `**Session:**` is missing or is not this session's id. To check an older file by hand from another session, run it as `env -u CLAUDE_CODE_SESSION_ID python3 ~/.claude/scripts/check_handoff.py <file> --git yes|no`.
+- Writing gate: when `CLAUDE_CODE_SESSION_ID` is a UUID, `check_handoff.py` reads this session's transcript. It exits 1 with `after-handoff` when a user message after the last `/handoff` is not quoted in the section (a message under 40 characters must open its own `- 「` line; a longer one counts when its whole quote, or for one over 300 characters its first 259 characters and its last 40, appears inside one line), and prints the missing messages verbatim (at most 5). It exits 1 with `contract-session` when `**Session:**` is missing or is not this session's id. To check an older file by hand from another session, run it as `env -u CLAUDE_CODE_SESSION_ID python3 ~/.claude/scripts/check_handoff.py <file> --git yes|no`.
 - Resume gate: when the file's `**Session:**` is a UUID, `handoff_state.py --resume` reads that transcript again. Messages that the section does not quote make `continue: no (unrecorded messages after handoff)`, even with `--c`, and print `WARNING: N user message(s) after the last /handoff are not in the handoff file` with one indented line per message. `project mismatch` and `newer handoff skipped` win over this reason, but the WARNING is printed either way. The briefing starts with an `AFTER HANDOFF:` block. To go on, the user either returns to the old session (`claude --resume <the **Session:** id>`), appends the missing lines to `## After Handoff`, and reruns the checker, or says `계속` in the new session, which applies the missing messages first as the latest decisions.
 - Degrade: when the transcript is missing, unreadable, too large, or in an unknown format, or has no `/handoff` input, both gates print `WARNING: after-handoff messages not checked: <reason>`. Exit codes and `continue:` do not change. A file without `**Session:**`, or with `none`, is not checked on resume.
 - Output contract: when the session variable is a UUID, `handoff_state.py` in its default mode prints two more lines, `session id: <uuid>` and `transcript: <path | none (not found)>`, so the default output is up to 27 lines instead of 25. Without the variable the output is unchanged.
 - `run_report.py` counts two new warning kinds: `after-handoff messages not checked` and `user messages after the last /handoff not in the handoff file`. The two failure codes are counted in `fail_codes`.
 - Accepted limit: the gates compare user messages only. A decision that was reached but never typed, or one the session omitted from the file before `/handoff` ran, is not caught.
+
+### Before Handoff and Reviews
+Two more optional sections keep what the session knew right before `/handoff`.
+
+- `## Before Handoff` (right before `## After Handoff`): one line per user message right before the last `/handoff` input (the last 5) and per argument of that input. A line is `- 「<the user's own sentence>」 → 반영: <section title>` or `- 「…」 → 무관`. `반영:` names a `## ` section of the file exactly. A message that opens with a long quote of the assistant's output is written from the user's own sentence on, when that sentence is 40 characters or more. A line quotes the message whole; one over 300 characters is its first 259 characters, `…`, and its last 40. The checker shows the lines to copy.
+- `## Reviews` (right after `## Decisions Made`): one row per review run of the session: `- <agent id | runId> · <type> · <final verdict | running> · <adopted or rejected, one line>`. A review run is an Agent whose type, after its last `:`, contains `review`, `critic`, or `judge` or equals `architect` or `verifier`, and every Workflow run. A review by an agent of any other type is not counted.
+- Writing gate: when `CLAUDE_CODE_SESSION_ID` is a UUID, `check_handoff.py` exits 1 with `before-handoff` or `reviews` for each missing line or row. A row copied as printed still fails until its verdict and last cell are filled. It exits 1 with `contract-next-step-deps` when a numbered `Exact Next Step` step after a 🔴 user step lacks `(독립)` or `(← n)`. When the transcript cannot be read, `WARNING: reviews not checked: <reason>` is printed next to the after-handoff WARNING, and the exit code does not change. A review launch whose result carries no `agentId` (`runId` for a Workflow) prints the same WARNING; the other runs are still checked.
+- Resume: `handoff_state.py --resume` prints `before handoff: N user message(s)` with the messages (at most 6), and a WARNING when `## Before Handoff` lacks some of them. It is display only, so `continue:` does not change. The briefing has a `BEFORE HANDOFF:` block and a `REVIEWS:` block.
+- Size: the checker warns above 24 KiB (`WARNING: handoff file is <N> KiB (over 24 KiB)`).
+- Output contract: without the session variable the output is byte-identical to 2026.11.09-3, except the usage line (`over 24 KiB`), the ` (missing: …)` ending of an item failure with the new `contract-live-chain` wording, and the size warning at 24 KiB. The full list is in `CHANGELOG.md`.
+- Accepted limit: `무관` is not gated. The briefing shows the original message, so a misjudged line can be seen.
 
 ## Run Log
 - Each run of the two scripts appends one JSON line to `~/.claude/handoffs/.state/runs.jsonl`. It records the path of the handoff file, not the body.
@@ -227,7 +240,7 @@ A decision the user gives after `/handoff` starts is not in the file body. Two g
 ### Run Report
 `run_report.py` reads the run log (and `runs.jsonl.1` when it exists) and prints what happened and what to fix. It never writes the log. It never prints the `stdout` or `args` of a record. Do not paste report output into a public repository, because it holds local paths and session ids.
 
-Every line has 19 keys. These five are the newest. A key without a value is `null`. Lines written by an older version lack them, and the report counts those lines under Coverage.
+Every line has 26 keys. These twelve are the newest. A key without a value is `null`. Lines written by an older version lack them, and the report counts those lines under Coverage.
 
 | Key | Contents |
 |---|---|
@@ -236,6 +249,13 @@ Every line has 19 keys. These five are the newest. A key without a value is `nul
 | `project` | The project key. For a check run, the `**Toplevel:**` of the checked file when it is an existing absolute folder |
 | `fail_codes` | `check_handoff.py` only. An object of fixed failure codes with counts, `{}` on a pass, `null` for `handoff_state.py` |
 | `handoff_bytes` | `check_handoff.py` only. The UTF-8 byte count of the checked text after newline normalization to LF (the same basis as the checker's `WARNING: handoff file is <N> KiB` line) |
+| `after_handoff_lines` | `check_handoff.py` on the writing side only. The number of user messages after the last `/handoff`. `null` when the gate did not run or the transcript could not be judged |
+| `before_handoff_lines` | The same side. The number of Before Handoff messages (the arguments of `/handoff` included, 0 to 6) |
+| `before_unrelated` | The same side. How many matched Before Handoff lines end in `무관` |
+| `attempt_n` | The same side. The try number at this handoff file in this session: the earlier direct checks of it, plus one (1 when the log file does not exist yet). Paths compare after `expanduser`, as absolute paths |
+| `elapsed_ms` | The same side. Milliseconds from the last `/handoff` input to this check |
+| `reviews_found` | The same side. The number of review runs found in the transcript. `null` when it could not be judged |
+| `reviews_recorded` | The same side. How many of them have a valid row in `## Reviews` |
 
 ```
 python3 ~/.claude/scripts/run_report.py [--log PATH] [--since DATE] [--project PATH] [--version V] [--json]
@@ -249,6 +269,9 @@ python3 ~/.claude/scripts/run_report.py [--log PATH] [--since DATE] [--project P
 | `--version V` | Only records of that version. `V` also matches `V-<n>` and `V.<n>` |
 | `--json` | The same content as JSON with fixed keys |
 
+- A run that only printed the usage is counted as `handoff_state.py/usage` or `check_handoff.py/usage` in Runs. A check usage run is also counted as the code `usage`.
+- Check failures also gives the attempts to pass per version (`attempts_by_version`, one line per version).
+- Handoff size counts the last direct check of each file directly under `~/.claude/handoffs/`. A resume's own check, a fixture, and a scratch path are left out. The limit is 24 KiB (`over_24_kib`).
 - Exit code 0: the report was printed, including when the log is missing or empty.
 - Exit code 2: a usage error (for example a bad `--since` value, or `HANDOFF_LOG=off` without `--log`), a log path that cannot be read, or an internal error (one stderr line, no traceback).
 
@@ -280,6 +303,8 @@ These are the exit codes of `check_handoff.py`.
 | `HANDOFF_CALLER` | Set by `handoff_state.py` for the checker it runs. The run log records it as `caller` only when the value is `handoff_state.py` |
 
 If `~/.claude/scripts/context_budget.py` exists, `handoff_state.py` loads it and prints a `context-budget:` line. If it does not exist, no line is printed. This file is not in this repository, and `install.py` does not touch it.
+
+If `~/.claude/state/lean-mode.json` (written by the lean skill) exists, `handoff_state.py` prints one `lean-mode:` line (`on (since <UTC time>)`, `off`, `off (set for another project)`, or `unknown`) so that a resumed session knows lean mode carries over. The mode is project-scoped: `on` counts only when the file's `project` is the current project, and the path is never printed. Without the file no line is printed.
 
 ## Rules Files
 The core rules are the same for every user. What a user or a project wants to do differently goes into the two rules files. The layers apply in this order:

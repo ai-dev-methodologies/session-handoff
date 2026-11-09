@@ -49,7 +49,7 @@ row; it fails as `secret-like value (private key block) on lines <A>-<B>; replac
 REDACTED`. These failures print first. No printed line carries the value: every other check reads this
 file and the Continues file with those forms and every line of a key block replaced by REDACTED.
 
-A file over SIZE_LIMIT_KIB prints one `WARNING: handoff file is <N> KiB (over 16 KiB)` line after the result
+A file over SIZE_LIMIT_KIB prints one `WARNING: handoff file is <N> KiB (over 24 KiB)` line after the result
 block; the exit code is unchanged.
 Every run appends one record to the run log (run_log.py next to this file).
 
@@ -63,6 +63,7 @@ import re
 import sys
 import traceback
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 
 SECTIONS = ("What Has NOT Been Tried Yet", "Decisions Made")  # open designs and decisions; blockers and next-step lines are navigation
@@ -95,7 +96,7 @@ CHANGE_SPLIT_RE = re.compile(r"\s*\|\s+")
 QUOTE_RE = re.compile(r"\"[^\"]+\"|“[^”]+”|「[^」]+」")
 CLOSED_SECTION = "Closed (pointers)"
 CLOSED_RE = re.compile(r"^\s*[-*]\s+.*?(?:→|->)\s*(.+?)\s*\(keys:\s*(.*?)\)\s*$")
-SIZE_LIMIT_KIB = 16
+SIZE_LIMIT_KIB = 24
 SECRET_PATTERNS = (  # provider token forms only; the left guard keeps `task-…` and `disk-…` slugs out
     ("GitHub token", re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,}")),
     ("GitHub fine-grained token", re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{22,}")),
@@ -125,8 +126,20 @@ SESSION_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-
 RESUME_CALLER = "handoff_state.py"  # a resume checks a file another session wrote: no writing-side checks
 AFTER_SECTION = "After Handoff"
 QUOTE_PREFIX_CHARS = 40  # a message is recorded when 「 plus its first 40 characters (a shorter one 「whole」) is quoted
-QUOTE_MAX_CHARS = 300
+QUOTE_MAX_CHARS = 300  # match_quotes: a message up to this long is quoted whole
+QUOTE_EDGE_CHARS = 40  # a longer one by an item holding its first QUOTE_HEAD_CHARS and its last this many characters
+QUOTE_HEAD_CHARS = QUOTE_MAX_CHARS - QUOTE_EDGE_CHARS - 1  # 259: quote_line shows head, `…`, edge in QUOTE_MAX_CHARS
+QUOTE_STRIP_MIN = 40  # a leading quote this long (marks included) is the assistant's output, not the user's text
+QUOTE_OWN_MIN = 40  # ... cut only when the user's text after it is this long; a shorter one keeps the whole message
 SHOWN_MAX = 5
+BEFORE_SECTION = "Before Handoff"
+BEFORE_MAX = 5  # the messages right before the last /handoff input that Before Handoff records, plus its arguments
+UNRELATED, REFLECTED = "무관", "반영"  # a Before Handoff item ends `→ 무관` or `→ 반영: <section title>`
+REVIEWS_SECTION = "Reviews"
+REVIEW_WORDS = ("review", "critic", "judge")  # in the last `:` token of a subagent type
+REVIEW_TYPES = ("architect", "verifier")  # equal to the last `:` token
+WORKFLOW_TYPE = "workflow"  # every Workflow run is a review run
+ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
 TRANSCRIPT_MAX_BYTES = 512 * 1024 * 1024
 TRANSCRIPT_KEYS = ('"user"', '"assistant"', "queued_command")  # only lines holding one are parsed
 COMMAND_TAGS = ("<command-", "<bash-", "<local-command-")  # a typed slash, ! or local command, not a message
@@ -142,7 +155,8 @@ def code_slug(text: str) -> str:
 FAIL_CODES = (  # the closed vocabulary of the run log's fail_codes: constants only, never message text
     ("decisions-table", "contract-toplevel", "contract-continues", "contract-closed", "contract-live-chain",
      "contract-goal-missing", "contract-goal-drift", "contract-session-state", "contract-next-step",
-     "usage", "unreadable", "internal", "secret:other", "after-handoff", "contract-session")
+     "usage", "unreadable", "internal", "secret:other", "after-handoff", "contract-session",
+     "contract-next-step-deps", "before-handoff", "reviews")
     + tuple(f"secret:{code_slug(label)}" for label, _ in SECRET_PATTERNS) + (f"secret:{code_slug(KEY_KIND)}",)
     + tuple(f"item-incomplete:{code_slug(title)}" for title in SECTIONS)
 )
@@ -551,7 +565,8 @@ def live_chain_failures(lines: "list[str]") -> "list[str]":
     if not prev_lines:
         return []
     kept = {key for _, key in live_keys(lines)} | closed_keys(lines)
-    return [f"Live item {name} from the previous handoff is missing (carry it or close it)"
+    return [f"Live item {name} from the previous handoff is missing: keep an item with id {key} in a Live field, "
+            f"or list {key} in a Closed (pointers) keys list"
             for name, key in live_keys(prev_lines) if key not in kept]
 
 
@@ -593,6 +608,28 @@ def next_step_missing(lines: "list[str]") -> bool:
     real = [ln for ln in nxt.split("\n") if not is_placeholder(ln)]
     block = "\n".join(real).strip()
     return not real or (block[:1], block[-1:]) in (("[", "]"), ("<", ">"))
+
+
+STEP_RE = re.compile(r"^(\d+)\.\s")  # an unindented numbered line; bullets and nested lines are not steps
+USER_STEP = "\U0001F534"  # 🔴
+DEP_RE = re.compile(r"\((?:독립|independent|(?:←|<-)\s*(\d+))\)", re.I)
+
+
+def next_step_dep_failures(lines: "list[str]") -> "list[str]":
+    """Every numbered step after the first 🔴 user step carries (독립), (independent), or (← n) of a smaller step n."""
+    steps: "list[tuple[int, str]]" = []
+    for line in (section_body(lines, "Exact Next Step") or "").split("\n"):
+        m = STEP_RE.match(line)
+        if m:
+            steps.append((int(m.group(1)), line))
+        elif steps and line.startswith((" ", "\t")):
+            steps[-1] = (steps[-1][0], f"{steps[-1][1]} {line.strip()}")
+    user = next((n for n, text in steps if USER_STEP in text), None)
+    if user is None:
+        return []
+    return [f"Exact Next Step step {n} comes after the {USER_STEP} user step {user} and lacks (독립) or (← n)"
+            for n, text in steps
+            if n > user and not any(m.group(1) is None or int(m.group(1)) < n for m in DEP_RE.finditer(text))]
 
 
 def resume_contract_parts(lines: "list[str]", git: "bool | None" = None,
@@ -727,15 +764,66 @@ def message_time(rec: dict) -> str:
     return ts if isinstance(ts, str) else ""
 
 
-def messages_after_handoff(path: Path) -> "tuple[list[tuple[str, str]], str | None]":
-    """(normalized text, timestamp) of each message after the last /handoff input, by position in the file,
-    a text given twice listed twice; or ([], reason) when the transcript cannot be judged. Never raises."""
+def is_review_type(subagent_type) -> bool:
+    """True when the last `:` token of an Agent's subagent_type holds a REVIEW_WORDS word or is one of REVIEW_TYPES."""
+    if not isinstance(subagent_type, str):
+        return False
+    last = subagent_type.rsplit(":", 1)[-1].lower()
+    return any(word in last for word in REVIEW_WORDS) or last in REVIEW_TYPES
+
+
+def fold_review_run(rec: dict, n: int, launched: dict, runs: dict) -> "str | None":
+    """Fold record number n into the review runs. A Workflow launch, or an Agent launch of a review type (assistant
+    tool_use), waits in `launched` (tool_use id -> (n, type)) until the tool_result record carries its run id in
+    toolUseResult: runId for a Workflow, agentId for an Agent. A string result (a failed launch) counts nothing.
+    `runs` maps a run id to (launch number, type), the first launch of an id only. Returns why a dict result went
+    uncounted (it carries no run id), else None."""
+    lost = None
+    message = rec.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict):
+            continue
+        if rec.get("type") == "assistant" and block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+            given = block.get("input")
+            if block.get("name") == "Workflow":
+                launched[block["id"]] = (n, WORKFLOW_TYPE)
+            elif block.get("name") == "Agent" and isinstance(given, dict) and is_review_type(given.get("subagent_type")):
+                launched[block["id"]] = (n, given["subagent_type"])
+        elif rec.get("type") == "user" and block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
+            start, kind = launched.pop(block["tool_use_id"], (None, None))
+            result = rec.get("toolUseResult")
+            rid = result.get("runId" if kind == WORKFLOW_TYPE else "agentId") if kind and isinstance(result, dict) else None
+            if isinstance(rid, str) and rid.split() == [rid]:
+                runs.setdefault(rid, (start, kind))
+            elif kind and isinstance(result, dict):
+                lost = "runId missing from a Workflow result" if kind == WORKFLOW_TYPE else "agentId missing from an Agent result"
+    return lost
+
+
+def handoff_args(rec: dict) -> "list[str]":
+    """[the non-empty `<command-args>` after the /handoff command name of a typed /handoff input], else []."""
+    message = rec.get("message") if rec.get("type") == "user" else None
+    text = content_text(message.get("content")) if isinstance(message, dict) else ""
+    m = ARGS_RE.search(text.split(HANDOFF_COMMAND, 1)[1]) if HANDOFF_COMMAND in text else None
+    return [m.group(1)] if m and m.group(1).strip() else []
+
+
+def scan_transcript(path: Path) -> dict:
+    """One pass over a session transcript (new-format-spec section 21). Raw (text, timestamp) of each message after
+    the last /handoff input (`after`) and of the BEFORE_MAX messages right before it, counted past earlier /handoff
+    inputs (`before`); that input's arguments as `(text, timestamp)`, none or one (`args`), and its timestamp
+    (`baseline_ts`); the review runs of the whole transcript as (id, type) in launch order (`reviews`); why the
+    messages (`msg_reason`) or the review runs (`review_reason`) cannot be judged, else None; and why a review launch
+    went uncounted (`review_note`, fold_review_run), else None. Never raises."""
+    found = {"after": [], "before": [], "args": [], "baseline_ts": None, "reviews": [], "review_note": None}
     try:
         if path.stat().st_size > TRANSCRIPT_MAX_BYTES:
-            return [], "transcript too large"
-        msgs, human, baseline = [], False, False
+            return dict(found, msg_reason="transcript too large", review_reason="transcript too large")
+        after, recent, before, args, stamp = [], [], [], [], None
+        human, baseline, launched, runs, note = False, False, {}, {}, None
         with path.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
+            for n, line in enumerate(f):
                 if not any(key in line for key in TRANSCRIPT_KEYS):
                     continue
                 try:
@@ -745,20 +833,94 @@ def messages_after_handoff(path: Path) -> "tuple[list[tuple[str, str]], str | No
                 if not isinstance(rec, dict):
                     continue
                 human = human or (rec.get("type") == "user" and isinstance(rec.get("origin"), dict))
+                note = fold_review_run(rec, n, launched, runs) or note
                 label = classify_record(rec)
                 if label == "baseline":
-                    msgs, baseline = [], True
+                    after, before, baseline = [], recent[-BEFORE_MAX:], True
+                    stamp = message_time(rec) or None
+                    args = [(text, stamp or "") for text in handoff_args(rec)]
                 elif label == "message":
-                    msgs.append((normalize(record_text(rec)), message_time(rec)))
+                    msg = (record_text(rec), message_time(rec))
+                    after.append(msg)
+                    recent = (recent + [msg])[-BEFORE_MAX:]
         if not human:
-            return [], "transcript format unknown"
+            return dict(found, msg_reason="transcript format unknown", review_reason="transcript format unknown")
+        reviews = [(rid, kind) for rid, (_, kind) in sorted(runs.items(), key=lambda run: run[1][0])]
         if not baseline:
-            return [], "no /handoff input in transcript"
-        return [(text, ts) for text, ts in msgs if text], None
+            return dict(found, reviews=reviews, review_note=note, msg_reason="no /handoff input in transcript",
+                        review_reason=None)
+        return {"after": after, "before": before, "args": args, "baseline_ts": stamp, "reviews": reviews,
+                "review_note": note, "msg_reason": None, "review_reason": None}
     except OSError:
-        return [], "transcript unreadable"
-    except Exception:  # a record shape this code does not know: the gate steps aside, the run goes on
-        return [], "transcript format unknown"
+        return dict(found, msg_reason="transcript unreadable", review_reason="transcript unreadable")
+    except Exception:  # a record shape this code does not know: the gates step aside, the run goes on
+        return dict(found, msg_reason="transcript format unknown", review_reason="transcript format unknown")
+
+
+def split_quote(raw: str) -> "tuple[str, bool]":
+    """(the user's own text, whether a leading quote was cut). After leading whitespace, a quote of the assistant's
+    output opens the message: `'` to the next `'`, `「` to the first `」`, or a run of lines opening with `>`. It is cut
+    when it is QUOTE_STRIP_MIN characters or more (marks included, normalized) and QUOTE_OWN_MIN characters or more
+    (normalized) follow it. Any other message, one opening with `<pasted_content` (it has no end mark) included, is all
+    the user's own text."""
+    text = raw.lstrip()
+    if text[:1] in ("'", "「"):
+        end = text.find("'" if text[0] == "'" else "」", 1)
+        if end < 0:
+            return raw, False
+        quote, rest = text[:end + 1], text[end + 1:]
+    elif text.startswith(">"):
+        lines = text.split("\n")
+        k = next((i for i, line in enumerate(lines) if not line.startswith(">")), len(lines))
+        quote, rest = "\n".join(lines[:k]), "\n".join(lines[k:])
+    else:
+        return raw, False
+    if len(normalize(quote)) < QUOTE_STRIP_MIN or len(normalize(rest)) < QUOTE_OWN_MIN:
+        return raw, False
+    return rest, True
+
+
+def own_text(raw: str) -> str:
+    """The user's own text of a message, before normalizing: split_quote without the flag."""
+    return split_quote(raw)[0]
+
+
+def own_messages(pairs: "list[tuple[str, str]]") -> "list[tuple[str, bool, str]]":
+    """(normalized own text, whether a leading quote was cut, timestamp) per raw (text, timestamp); empty ones dropped."""
+    out = []
+    for text, ts in pairs:
+        own, cut = split_quote(text)
+        n = normalize(own)
+        if n:
+            out.append((n, cut, ts))
+    return out
+
+
+def read_session(path: "Path | None") -> dict:
+    """scan_transcript with every message as own_messages gives it and the arguments as (normalized text, False,
+    timestamp). Both reasons are "transcript not found" when path is None. Never raises."""
+    if path is None:
+        return {"after": [], "before": [], "args": [], "baseline_ts": None, "reviews": [], "review_note": None,
+                "msg_reason": "transcript not found", "review_reason": "transcript not found"}
+    got = scan_transcript(path)
+    try:
+        args = [(normalize(text), False, ts) for text, ts in got["args"]]
+        return dict(got, after=own_messages(got["after"]), before=own_messages(got["before"]),
+                    args=[arg for arg in args if arg[0]])
+    except Exception:
+        return {"after": [], "before": [], "args": [], "baseline_ts": None, "reviews": [], "review_note": None,
+                "msg_reason": "transcript format unknown", "review_reason": "transcript format unknown"}
+
+
+def messages_after_handoff(path: Path) -> "tuple[list[tuple[str, str]], str | None]":
+    """(normalized text, timestamp) of each message after the last /handoff input, by position in the file,
+    a text given twice listed twice; or ([], reason) when the transcript cannot be judged. Never raises.
+    The 2026.11.09-3 view: the whole text, a leading quote kept; the gates use read_session."""
+    got = scan_transcript(path)
+    if got["msg_reason"]:
+        return [], got["msg_reason"]
+    msgs = [(normalize(text), ts) for text, ts in got["after"]]
+    return [(text, ts) for text, ts in msgs if text], None
 
 
 def unrecorded(msgs: "list[tuple[str, str]]", section_text: str) -> "list[tuple[str, str]]":
@@ -776,17 +938,89 @@ def unrecorded(msgs: "list[tuple[str, str]]", section_text: str) -> "list[tuple[
     return out
 
 
-def shown_quotes(msgs: "list[tuple[str, str]]") -> "list[str]":
-    """`「<text, cut at QUOTE_MAX_CHARS>」 (HH:MM:SSZ)` for the first SHOWN_MAX messages, then `… and N more`."""
-    out = []
-    for text, ts in msgs[:SHOWN_MAX]:
+def disposition(item: str, titles: "set[str]") -> "str | None":
+    """UNRELATED or REFLECTED by the text after the item's last `→ `: `무관` (text may follow after a space) or
+    `반영: <a title in titles>` exactly; None for anything else."""
+    tail = item.rsplit("→ ", 1)[1] if "→ " in item else ""
+    if tail == UNRELATED or tail.startswith(UNRELATED + " "):
+        return UNRELATED
+    if tail.startswith(REFLECTED + ": ") and tail[len(REFLECTED) + 2:] in titles:
+        return REFLECTED
+    return None
+
+
+def quotes_message(item: str, text: str, cut: bool) -> bool:
+    """A normalized `- 「` item quotes a message's own text, as quote_line shows it. Over QUOTE_MAX_CHARS: its first
+    QUOTE_HEAD_CHARS characters and its last QUOTE_EDGE_CHARS right before 」. Else whole: `「text」`, opening the item
+    when shorter than QUOTE_EDGE_CHARS, or `text」` when a leading quote was cut (the quote copied along)."""
+    if len(text) > QUOTE_MAX_CHARS:
+        return text[:QUOTE_HEAD_CHARS] in item and text[-QUOTE_EDGE_CHARS:] + "」" in item
+    if len(text) < QUOTE_EDGE_CHARS:
+        return item.startswith("- 「" + text + "」")
+    return (text if cut else "「" + text) + "」" in item
+
+
+def match_quotes(msgs: "list[tuple[str, bool, str]]", section_text: str,
+                 titles: "set[str] | None" = None) -> "tuple[list[tuple[str, str]], int]":
+    """(the messages the section does not quote as (text, timestamp), how many matched items end in `→ 무관`).
+    msgs are read_session's (own text, quote cut, timestamp). Each `- 「` list item quotes one message at most: a
+    message takes the first unused item that quotes it (quotes_message) and, with titles (Before Handoff), carries a
+    disposition naming one of them (new-format-spec section 21)."""
+    free = [item for item in (normalize(i) for i in items_of(section_text.split("\n"))) if item.startswith("- 「")]
+    missing, unrelated = [], 0
+    for text, cut, ts in msgs:
         n = normalize(text)
-        shown = n if len(n) <= QUOTE_MAX_CHARS else n[:QUOTE_MAX_CHARS] + "…"
-        m = TIME_RE.search(ts)
-        out.append(f"「{shown}」" + (f" ({m.group(1)}Z)" if m else ""))
+        hit = next((i for i, item in enumerate(free) if quotes_message(item, n, cut)
+                    and (titles is None or disposition(item, titles))), None)
+        if hit is None:
+            missing.append((text, ts))
+            continue
+        item = free.pop(hit)
+        if titles is not None and disposition(item, titles) == UNRELATED:
+            unrelated += 1
+    return missing, unrelated
+
+
+def reflect_titles(lines: "list[str]") -> "set[str]":
+    """The `## ` section titles a Before Handoff item may name after `→ 반영: `: all but Before and After Handoff."""
+    titles = {normalize(l.strip()[3:]) for l in lines if l.strip().startswith("## ")}
+    return titles - {BEFORE_SECTION, AFTER_SECTION}
+
+
+def unrecorded_reviews(reviews: "list[tuple[str, str]]", section_text: str) -> "list[tuple[str, str]]":
+    """The review runs (id, type) without an item `- <id> · <type> · <verdict> · <adopted/rejected>` in the section:
+    a normalized list item opening with `- <id> · `, four or more ` · ` cells, the third and fourth not placeholders."""
+    items = [normalize(item) for item in items_of(section_text.split("\n"))]
+    def recorded(rid):
+        cells = [item[2:].split(" · ") for item in items if item.startswith(f"- {rid} · ")]
+        return any(len(c) >= 4 and not is_placeholder(c[2]) and not is_placeholder(c[3]) for c in cells)
+    return [(rid, kind) for rid, kind in reviews if not recorded(rid)]
+
+
+def quote_line(text: str, ts: str) -> str:
+    """`「<text>」 (HH:MM:SSZ)`; past QUOTE_MAX_CHARS the text is its first QUOTE_HEAD_CHARS characters, `…` and its
+    last QUOTE_EDGE_CHARS, QUOTE_MAX_CHARS in all, so the line as shown still quotes the message."""
+    n = normalize(text)
+    shown = n if len(n) <= QUOTE_MAX_CHARS else n[:QUOTE_HEAD_CHARS] + "…" + n[-QUOTE_EDGE_CHARS:]
+    m = TIME_RE.search(ts)
+    return f"「{shown}」" + (f" ({m.group(1)}Z)" if m else "")
+
+
+def shown_quotes(msgs: "list[tuple[str, str]]") -> "list[str]":
+    """quote_line for the first SHOWN_MAX messages, then `… and N more`."""
+    out = [quote_line(text, ts) for text, ts in msgs[:SHOWN_MAX]]
     if len(msgs) > SHOWN_MAX:
         out.append(f"… and {len(msgs) - SHOWN_MAX} more")
     return out
+
+
+def elapsed_ms(ts: "str | None") -> "int | None":
+    """Milliseconds from an ISO timestamp to now; None when it does not parse, has no zone, or lies ahead."""
+    try:
+        ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() * 1000)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return ms if ms >= 0 else None
 
 
 def writer_session() -> "str | None":
@@ -805,18 +1039,39 @@ def session_failures(lines: "list[str]", session_id: str) -> "list[str]":
     return []
 
 
+def handoff_gates(session_id: str, lines: "list[str]") -> dict:
+    """The transcript gates of a handoff file on one read of the session's transcript (new-format-spec section 21):
+    `after` and `before`, the messages After Handoff and Before Handoff do not quote, as (text, timestamp); `reviews`,
+    the review runs Reviews does not record, as (id, type); `msg_reason` and `review_reason`, why either side was not
+    checked, else None; `review_note`, why a review launch went uncounted, else None; and the run-log counts
+    `after_lines`, `before_lines`, `before_unrelated`, `reviews_found`, `reviews_recorded` (None for a side not
+    checked) with `baseline_ts`. Never raises."""
+    empty = {"after": [], "before": [], "reviews": [], "after_lines": None, "before_lines": None,
+             "before_unrelated": None, "reviews_found": None, "reviews_recorded": None, "baseline_ts": None,
+             "review_note": None}
+    try:
+        got = read_session(find_transcript(session_id))
+        out = dict(empty, msg_reason=got["msg_reason"], review_reason=got["review_reason"], baseline_ts=got["baseline_ts"],
+                   review_note=got["review_note"])
+        if not got["msg_reason"]:
+            targets = got["before"] + got["args"]
+            out["after"] = match_quotes(got["after"], section_body(lines, AFTER_SECTION) or "")[0]
+            out["before"], out["before_unrelated"] = match_quotes(
+                targets, section_body(lines, BEFORE_SECTION) or "", reflect_titles(lines))
+            out["after_lines"], out["before_lines"] = len(got["after"]), len(targets)
+        if not got["review_reason"]:
+            out["reviews"] = unrecorded_reviews(got["reviews"], section_body(lines, REVIEWS_SECTION) or "")
+            out["reviews_found"] = len(got["reviews"])
+            out["reviews_recorded"] = len(got["reviews"]) - len(out["reviews"])
+        return out
+    except Exception:
+        return dict(empty, msg_reason="transcript format unknown", review_reason="transcript format unknown")
+
+
 def after_handoff_check(session_id: str, lines: "list[str]") -> "tuple[list[tuple[str, str]], str | None]":
     """(messages after the last /handoff missing from After Handoff, None), or ([], why they were not checked)."""
-    try:
-        path = find_transcript(session_id)
-        if path is None:
-            return [], "transcript not found"
-        msgs, reason = messages_after_handoff(path)
-        if reason:
-            return [], reason
-        return unrecorded(msgs, section_body(lines, AFTER_SECTION) or ""), None
-    except Exception:
-        return [], "transcript format unknown"
+    gates = handoff_gates(session_id, lines)
+    return ([], gates["msg_reason"]) if gates["msg_reason"] else (gates["after"], None)
 
 
 def split_cells(line: str) -> "list[str]":
@@ -874,11 +1129,16 @@ def items_of(section_lines: "list[str]") -> "list[str]":
     return items
 
 
-def passes(item: str) -> bool:
+def missing_labels(item: str) -> "list[str]":
+    """The what/why/how labels the item lacks; empty when it names a design file."""
     low = item.lower()
     if DESIGN_PATH_RE.search(item):
-        return True
-    return all(any(label in low for label in pair) for pair in LABELS)
+        return []
+    return [pair[0].rstrip(":") for pair in LABELS if not any(label in low for label in pair)]
+
+
+def passes(item: str) -> bool:
+    return not missing_labels(item)
 
 
 def parse_argv(argv: "list[str]") -> "tuple[str, bool | None] | None":
@@ -922,17 +1182,25 @@ def main(argv: "list[str]") -> int:
             if len(flat) < MIN_ITEM_CHARS or flat.lower().startswith(("- none", "- 없음", "- no ")):
                 continue
             if not passes(item):
-                failures.append((title, flat[:120]))
+                failures.append((title, flat[:120] + f" (missing: {', '.join(missing_labels(item))})"))
     decisions = decisions_failures(lines)
     contract_pairs = resume_contract_parts(lines, git, path)
-    session, after, after_reason = writer_session(), [], None
-    if session:  # the writing side: the head names this session, and its late messages are recorded
+    session, after, after_reason, before, reviews, review_reason = writer_session(), [], None, [], [], None
+    if session:  # the writing side: the head names this session, and its messages and review runs are recorded
         contract_pairs.insert(2, ("contract-session", session_failures(lines, session)))
-        after, after_reason = after_handoff_check(session, lines)
+        contract_pairs.insert(3, ("contract-next-step-deps", next_step_dep_failures(lines)))
+        gates = handoff_gates(session, lines)
+        after, after_reason, before = gates["after"], gates["msg_reason"], gates["before"]
+        reviews, review_reason = gates["reviews"], gates["review_reason"] or gates["review_note"]
+        RUN["session"] = session
+        RUN["counts"] = {"after_handoff_lines": gates["after_lines"], "before_handoff_lines": gates["before_lines"],
+                         "before_unrelated": gates["before_unrelated"], "reviews_found": gates["reviews_found"],
+                         "reviews_recorded": gates["reviews_recorded"], "elapsed_ms": elapsed_ms(gates["baseline_ts"])}
     contract = [msg for _, msgs in contract_pairs for msg in msgs]
     RUN["parts"] = ([(secret_code(kind), [msg]) for kind, msg in secret_pairs]
                     + [(f"item-incomplete:{code_slug(title)}", [head]) for title, head in failures]
-                    + [("decisions-table", decisions)] + contract_pairs + [("after-handoff", [t for t, _ in after])])
+                    + [("decisions-table", decisions)] + contract_pairs + [("after-handoff", [t for t, _ in after])]
+                    + [("before-handoff", [t for t, _ in before]), ("reviews", [rid for rid, _ in reviews])])
     if secrets:  # first: the resume excerpt keeps only the first lines of this output
         print(f"[FAIL] {len(secrets)} secret-like value(s):")
         for msg in secrets:
@@ -953,7 +1221,17 @@ def main(argv: "list[str]") -> int:
         print(f'[FAIL] {len(after)} user message(s) after the last /handoff are not in "{AFTER_SECTION}":')
         for line in shown_quotes(after):
             print(f"  - {line}")
-    code = 1 if failures or decisions or contract or secrets or after else 0
+    if before:
+        print(f'[FAIL] {len(before)} user message(s) before the last /handoff are not in "{BEFORE_SECTION}" '
+              f"(write - 「…」 → {REFLECTED}: <section> | {UNRELATED}):")
+        for text, ts in before:
+            print(f"  - {quote_line(text, ts)}")
+    if reviews:
+        print(f'[FAIL] {len(reviews)} review run(s) of this session are not in "{REVIEWS_SECTION}" '
+              "(fill <verdict> and <채택/기각>):")
+        for rid, kind in reviews:
+            print(f"  - {rid} · {normalize(kind)} · <verdict> · <채택/기각>")
+    code = 1 if failures or decisions or contract or secrets or after or before or reviews else 0
     if not code:
         print("[PASS] open items carry what/why/how or a design path; Decisions table and resume contract satisfied; "
               "no secret-like values")
@@ -963,6 +1241,8 @@ def main(argv: "list[str]") -> int:
         print(f"WARNING: handoff file is {-(-size // 1024)} KiB (over {SIZE_LIMIT_KIB} KiB)")
     if after_reason:
         print(f"WARNING: after-handoff messages not checked: {after_reason}")
+    if review_reason:
+        print(f"WARNING: reviews not checked: {review_reason}")
     return code
 
 
@@ -1011,15 +1291,18 @@ def log_run(argv: "list[str]", code: int, stdout_lines: "list[str]") -> None:
         parsed = parse_argv(argv)
         fail = RUN.get("fail")
         fail_codes = {fail: 1} if fail else count_fail_codes(RUN.get("parts", []))
-        record_args = dict(
-            script="check_handoff.py", mode="check", cwd=str(Path.cwd()), toplevel=None, args=argv,
-            exit_code=code, stdout_lines=stdout_lines,
-            handoff=str(Path(parsed[0]).expanduser()) if parsed else None,
-            project=project_of(RUN.get("lines")), fail_codes=fail_codes, handoff_bytes=RUN.get("size"),
-        )
         spec = importlib.util.spec_from_file_location("run_log", Path(__file__).with_name("run_log.py"))
         run_log = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(run_log)
+        record_args = dict(
+            script="check_handoff.py", mode="check", cwd=str(Path.cwd()), toplevel=None, args=argv,
+            exit_code=code, stdout_lines=stdout_lines,
+            handoff=run_log.handoff_path(parsed[0]) if parsed else None,
+            project=project_of(RUN.get("lines")), fail_codes=fail_codes, handoff_bytes=RUN.get("size"),
+            **RUN.get("counts", {}),
+        )
+        if RUN.get("session"):  # the writing side: which try at this file this run is
+            record_args["attempt_n"] = run_log.attempt_number(RUN["session"], record_args["handoff"])
         reason = run_log.append_run(run_log.build_record(**record_args))
     except Exception as exc:  # a missing or broken run_log.py never changes the result
         reason = f"{type(exc).__name__}: {exc}"

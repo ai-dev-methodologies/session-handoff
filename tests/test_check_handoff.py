@@ -7,6 +7,7 @@ fails for an unrelated reason cannot turn a negative test green.
 """
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -899,8 +900,8 @@ class ClosedPointersTest(CheckerCase):
 
 # --- 14.5: length budget -----------------------------------------------------------------------
 class SizeWarningTest(CheckerCase):
-    LIMIT = 16 * 1024
-    WARNING = re.compile(r"^WARNING: handoff file is (\d+) KiB \(over 16 KiB\)$", re.M)
+    LIMIT = 24 * 1024
+    WARNING = re.compile(r"^WARNING: handoff file is (\d+) KiB \(over 24 KiB\)$", re.M)
 
     def sized(self, size, base=None):
         """The valid fixture (or `base`) padded (in the last section) to exactly `size` bytes."""
@@ -909,7 +910,7 @@ class SizeWarningTest(CheckerCase):
         self.assertGreater(pad, 0)
         return text + "x" * (pad - 1) + "\n"
 
-    def test_C5_over_16_kib_warns_once_and_keeps_exit_0(self):
+    def test_C5_over_24_kib_warns_once_and_keeps_exit_0(self):
         text = self.sized(self.LIMIT + 1)
         self.assertEqual(len(text.encode("utf-8")), self.LIMIT + 1)
         proc = self.run_text(text)
@@ -922,7 +923,7 @@ class SizeWarningTest(CheckerCase):
         proc = self.run_text(self.sized(40 * 1024))
         self.assertEqual(self.WARNING.findall(proc.stdout), ["40"], proc.stdout)
 
-    def test_C5_exactly_16_kib_does_not_warn(self):
+    def test_C5_exactly_24_kib_does_not_warn(self):
         text = self.sized(self.LIMIT)
         self.assertEqual(len(text.encode("utf-8")), self.LIMIT)
         proc = self.run_text(text)
@@ -1484,7 +1485,7 @@ class TemplateFixtureTest(unittest.TestCase):
 
 
 # --- R5/R6: run log signals (fail_codes, handoff_bytes, project) -----------------------------------
-BASE_COMMIT = "c34a100e08ab4c4fc09f7ab3abaa31ae36281fad"
+BASE_COMMIT = "0970c2363cbef5af0ad8992e2d81893f950b2da0"
 BODY_SENTINEL = "body" + "sentinel" + "-7731"
 
 
@@ -1671,8 +1672,10 @@ class FailCodeTest(SignalCase):
     def test_R5_unresolvable_home_exit2(self):
         code, out, err, _ = self.call_run(["~nosuchuser_zz/x.md", "--git", "yes"])
         self.assertEqual(code, 2)  # the one documented exception: before, an uncaught exit 1 with a traceback
-        self.assertTrue(err.rstrip("\n").splitlines()[-1].startswith("WARNING: run log not written:"), err)
-        self.assertEqual(self.records(), [])
+        self.assertEqual(err.rstrip("\n").splitlines()[-1], "RuntimeError: Could not determine home directory.")
+        self.assertNotIn("run log not written", err)  # the record is kept, its path unexpanded
+        self.assertEqual([(r["handoff"], r["fail_codes"]) for r in map(json.loads, self.records())],
+                         [(str(Path.cwd() / "~nosuchuser_zz" / "x.md"), {"internal": 1})])
 
 
 class PartsInputs:
@@ -1857,11 +1860,23 @@ class BaseStdoutTest(SignalCase):
                 path = self.write(text, f"{name}.md")
                 old, new = self.both([str(path), *flags])
                 self.assertEqual(old.returncode, 1, old.stdout)
-                self.assertEqual((new.returncode, new.stdout), (old.returncode, old.stdout))
+                expected = old.stdout
+                if name == "live-chain":  # the one enumerated difference: the live-chain line has a new wording
+                    expected = re.sub(r"^(  - Live item .+? from the previous handoff is missing) \(carry it or close it\)$",
+                                      lambda m: f"{m.group(1)}: keep an item with id zz9 in a Live field, "
+                                                "or list zz9 in a Closed (pointers) keys list",
+                                      old.stdout, count=0, flags=re.M)
+                    self.assertNotEqual(expected, old.stdout, "the live-chain substitution did not happen")
+                    self.assertEqual(expected.count("keep an item with id"), 1)
+                self.assertEqual((new.returncode, new.stdout), (old.returncode, expected))
         with self.subTest(case="usage"):
             old, new = self.both([])
             self.assertEqual(old.returncode, 2)
-            self.assertEqual((new.returncode, new.stdout), (old.returncode, old.stdout))
+            expected = old.stdout.replace("(over 16 KiB)", "(over 24 KiB)")  # the one enumerated usage-line difference
+            self.assertEqual(old.stdout.count("(over 16 KiB)"), 1)
+            self.assertEqual((new.returncode, new.stdout), (old.returncode, expected))
+            differing = [1 for a, b in zip(old.stdout.splitlines(), new.stdout.splitlines()) if a != b]
+            self.assertEqual(len(differing), 1)
         with self.subTest(case="unreadable"):
             old, new = self.both([str(self.tmp / "nope.md")])
             self.assertEqual(old.returncode, 2)
@@ -1875,6 +1890,7 @@ M2 = "검토자에게는 A와 B 문서만 이슈 목록 없이 먼저 보낸다.
 A1 = "A and B now, C later"  # the dialog answer of fixture line 33
 CUT_BEFORE, CUT_DELIVERED, FULL = 25, 31, 35  # fixture line counts: before M1·M2 are delivered, after, everything
 GATE_BASE = "1c6bbeb"  # the checker before the after-handoff gate
+BEFORE_1 = "Keep the old report format for now."  # fixture line 5, the one message before the last /handoff
 
 
 def user_rec(text, ts="2026-11-09T07:00:00.000Z", **kw):
@@ -1903,6 +1919,7 @@ class AfterHandoffTests(SignalCase):
         super().setUp()
         self.mod = load_checker()
         self.text = self.base.replace("**Continues:** none", f"**Continues:** none\n**Session:** {SID}", 1)
+        self.text += f"\n## Before Handoff\n\n- 「{BEFORE_1}」 → 무관\n"  # the one message before the fixture's /handoff
         self.lines = TRANSCRIPT.read_text(encoding="utf-8").splitlines()
 
     def put(self, lines):
@@ -2110,7 +2127,10 @@ class AfterHandoffTests(SignalCase):
     def test_AH10_degrade(self):
         def warned(proc, reason):
             self.assertPasses(proc)
-            self.assertEqual(proc.stdout.splitlines()[-1], f"WARNING: after-handoff messages not checked: {reason}")
+            last = [f"WARNING: after-handoff messages not checked: {reason}"]
+            if reason != "no /handoff input in transcript":  # a transcript-wide reason: the reviews are not checked either
+                last.append(f"WARNING: reviews not checked: {reason}")
+            self.assertEqual(proc.stdout.splitlines()[-len(last):], last)
             self.assertNotIn("Traceback", proc.stderr)
         warned(self.gate(self.text), "transcript not found")
         self.put([self.lines[i] for i in (0, 1, 5, 7, 12)])  # no user record with an origin
@@ -2140,7 +2160,8 @@ class AfterHandoffTests(SignalCase):
     def test_AH11_session_header(self):
         self.put(self.lines[:CUT_DELIVERED])
         want = f"**Session:** must be this session's id {SID}"
-        for name, text in (("missing", self.base), ("other id", self.text.replace(SID, "11111111-1111-4111-8111-111111111111"))):
+        for name, text in (("missing", self.text.replace(f"\n**Session:** {SID}", "", 1)),
+                           ("other id", self.text.replace(SID, "11111111-1111-4111-8111-111111111111"))):
             with self.subTest(case=name):
                 proc = self.gate(self.with_after(M1, M2, text=text))
                 self.assertFailsWith(proc, "resume-contract problem(s):", want)
@@ -2207,7 +2228,8 @@ class AfterHandoffTests(SignalCase):
         self.assertFailsWith(proc, "[FAIL] 7 user message(s) after the last /handoff")
         shown = [ln for ln in proc.stdout.splitlines() if ln.startswith("  - 「")]
         self.assertEqual(len(shown), 5)
-        self.assertEqual(shown[0], "  - 「" + " ".join(long.split())[:300] + "…」 (07:00:00Z)")
+        n = " ".join(long.split())
+        self.assertEqual(shown[0], "  - 「" + n[:259] + "…" + n[-40:] + "」 (07:00:00Z)")
         self.assertIn("\n  - … and 2 more\n", proc.stdout)
         self.assertEqual(self.record()["fail_codes"], {"after-handoff": 7})
 
@@ -2238,6 +2260,817 @@ class AfterHandoffTests(SignalCase):
             gone = self.home / ".claude" / "projects" / "-tmp-gone" / f"{SID}.jsonl"
             with mock.patch.object(self.mod.Path, "glob", lambda folder, pattern: iter([gone, first])):
                 self.assertEqual(self.mod.find_transcript(SID), first)  # a copy gone between glob and stat
+
+
+# --- A0: failure hints, size limit, next-step dependency markers --------------------------------------
+A0_SID = "00000000-0000-4000-8000-0000000000a0"
+
+
+class FailureHintTest(CheckerCase):
+    def item_line(self, proc):
+        (line,) = [ln for ln in proc.stdout.splitlines() if ln.startswith("  - [What Has NOT Been Tried Yet]")]
+        return line
+
+    def test_BH20_item_missing_labels(self):
+        cases = {
+            "- Jitter on the backoff — what: spread retries across clients": " (missing: why, how)",
+            "- Jitter on the backoff — why: retries stampede after an outage · how: add random(0, delay)": " (missing: what)",
+            "- Jitter on the backoff, spread the retries across the clients after an outage": " (missing: what, why, how)",
+        }
+        for item, suffix in cases.items():
+            for extra_env in ({}, {"CLAUDE_CODE_SESSION_ID": A0_SID}):
+                with self.subTest(item=item, env=bool(extra_env)):
+                    text = set_section(self.base, "What Has NOT Been Tried Yet", item)
+                    if extra_env:
+                        text = text.replace("**Continues:** none", f"**Continues:** none\n**Session:** {A0_SID}", 1)
+                    proc = self.run_text(text, extra_env=extra_env)
+                    self.assertFailsWith(proc, "[What Has NOT Been Tried Yet]")
+                    self.assertEqual(self.item_line(proc), f"  - [What Has NOT Been Tried Yet] {item}{suffix}")
+
+    def test_BH20_label_hint_follows_the_120_character_cut(self):
+        item = "- " + "x" * 150 + " what: a"
+        proc = self.run_text(set_section(self.base, "What Has NOT Been Tried Yet", item))
+        self.assertEqual(self.item_line(proc), "  - [What Has NOT Been Tried Yet] " + item[:120] + " (missing: why, how)")
+
+    def test_BH20_korean_labels_and_design_path_count(self):
+        ok = "- 백오프 지터 — 무엇을: 재시도 분산 · 왜: 장애 뒤 몰림 · how: random(0, delay)"
+        self.assertPasses(self.run_text(set_section(self.base, "What Has NOT Been Tried Yet", ok)))
+        design = "- Jitter on the backoff, see plans/sync-retry-design.md for the whole proposal"
+        self.assertPasses(self.run_text(set_section(self.base, "What Has NOT Been Tried Yet", design)))
+
+
+class LiveChainMessageTest(CheckerCase):
+    def setUp(self):
+        super().setUp()
+        self.prev = self.tmp / "previous.md"
+        self.prev_text = PREVIOUS.read_text(encoding="utf-8")
+
+    def current(self, **state_kw):
+        cur = self.base.replace("**Continues:** none", f"**Continues:** {self.prev}")
+        return set_section(cur, "Session State", state_section(**state_kw))
+
+    def test_BH21_live_chain_message(self):
+        self.prev.write_text(self.prev_text, encoding="utf-8", newline="\n")
+        proc = self.run_text(self.current(subagents=live_item(), runners=None))
+        self.assertFailsWith(proc, "contract")
+        self.assertIn("\n  - Live item full-tests (b7f3e2) from the previous handoff is missing: keep an item with id "
+                      "b7f3e2 in a Live field, or list b7f3e2 in a Closed (pointers) keys list\n", proc.stdout)
+        self.assertNotIn("(carry it or close it)", proc.stdout)
+
+    def test_BH21_key_is_the_whole_name_without_an_id(self):
+        prev = set_section(self.prev_text, "Session State", state_section(
+            subagents=live_item(), runners=live_item("full-tests", item_id="b7f3e2"), scheduled=scheduled_item()))
+        self.prev.write_text(prev, encoding="utf-8", newline="\n")
+        proc = self.run_text(self.current(subagents=live_item(), runners=live_item("full-tests", item_id="b7f3e2")))
+        self.assertIn("\n  - Live item nightly-check from the previous handoff is missing: keep an item with id "
+                      "nightly-check in a Live field, or list nightly-check in a Closed (pointers) keys list\n", proc.stdout)
+
+
+class SizeLimitTest(CheckerCase):
+    WARNING = re.compile(r"^WARNING: handoff file is (\d+) KiB \(over 24 KiB\)$", re.M)
+
+    def sized(self, size):
+        text = self.base.rstrip("\n") + "\n"
+        pad = size - len(text.encode("utf-8"))
+        self.assertGreater(pad, 0)
+        return text + "x" * (pad - 1) + "\n"
+
+    def test_BH22_size_limit(self):
+        self.assertEqual(load_checker().SIZE_LIMIT_KIB, 24)
+        for kib in (20, 24):
+            with self.subTest(kib=kib):
+                proc = self.run_text(self.sized(kib * 1024))
+                self.assertPasses(proc)
+                self.assertNotIn("WARNING", proc.stdout)
+        proc = self.run_text(self.sized(25 * 1024))
+        self.assertPasses(proc)
+        self.assertIn("WARNING: handoff file is 25 KiB (over 24 KiB)", proc.stdout.splitlines())
+        self.assertEqual(proc.stdout.splitlines()[-1], "WARNING: handoff file is 25 KiB (over 24 KiB)")
+
+    def test_BH22_usage_line_is_the_only_docstring_change(self):
+        doc = load_checker().__doc__
+        self.assertIn("(over 24 KiB)", doc)
+        self.assertNotIn("16 KiB", doc)
+
+
+class NextStepDepsTest(CheckerCase):
+    CODE = "contract-next-step-deps"
+
+    def setUp(self):
+        super().setUp()
+        self.text = self.base.replace("**Continues:** none", f"**Continues:** none\n**Session:** {A0_SID}", 1)
+
+    def check(self, steps, env=True, extra_env=None):
+        text = set_section(self.text, "Exact Next Step", steps)
+        env_vars = {"CLAUDE_CODE_SESSION_ID": A0_SID} if env else {}
+        env_vars.update(extra_env or {})
+        return self.run_text(text, extra_env=env_vars)
+
+    def codes(self, steps, **kw):
+        proc = self.check(steps, **kw)
+        return proc, tail_record(self.tmp / "runs.jsonl")["fail_codes"]
+
+    def test_BH23_no_user_step_passes(self):
+        self.assertPasses(self.check("1. Run the tests\n2. Read the first failure\n3. Fix it"))
+
+    def test_BH23_markers_pass(self):
+        steps = "1. Prepare the sample\n2. 🔴 사용자: 회귀 실측 계획 승인\n3. 문서 오탈자 정리 (독립)\n4. 승인 뒤 파일럿 실행 (← 2)"
+        self.assertPasses(self.check(steps))
+        for marker in ("(independent)", "(<- 2)", "(← 1)"):
+            with self.subTest(marker=marker):
+                self.assertPasses(self.check(f"1. Prepare\n2. 🔴 user: approve the plan\n3. Run the pilot {marker}"))
+
+    def test_BH23_missing_marker_fails_with_code_and_message(self):
+        proc, codes = self.codes("1. Prepare\n2. 🔴 user: approve the plan\n3. Run the pilot\n4. Tidy docs (독립)")
+        self.assertFailsWith(proc, "Exact Next Step step 3 comes after the 🔴 user step 2 and lacks (독립) or (← n)")
+        self.assertEqual(codes, {self.CODE: 1})
+        self.assertNotIn("step 4", proc.stdout)
+        self.assertNotIn("step 1", proc.stdout)
+
+    def test_BH23_every_unmarked_later_step_is_listed(self):
+        proc, codes = self.codes("1. 🔴 user: approve\n2. Run the pilot\n3. Tidy docs")
+        self.assertEqual(codes, {self.CODE: 2})
+        self.assertIn("step 2 comes after the 🔴 user step 1", proc.stdout)
+        self.assertIn("step 3 comes after the 🔴 user step 1", proc.stdout)
+
+    def test_BH23_dependency_on_itself_or_a_later_step_fails(self):
+        for marker in ("(← 3)", "(← 4)", "(<- 3)"):
+            with self.subTest(marker=marker):
+                proc, codes = self.codes(f"1. 🔴 user: approve\n2. Prepare (독립)\n3. Run the pilot {marker}\n4. Tidy (독립)")
+                self.assertEqual(codes, {self.CODE: 1})
+
+    def test_BH23_bullets_and_indented_lines_are_not_steps(self):
+        steps = "1. 🔴 user: approve\n- a bullet with no marker\n   2. an indented sub-step with no marker\n2. Run (← 1)"
+        self.assertPasses(self.check(steps))
+
+    def test_BH23_user_step_last_passes(self):
+        self.assertPasses(self.check("1. Prepare\n2. Run\n3. 🔴 user: approve the release"))
+
+    def test_BH23_marker_may_sit_on_a_continuation_line(self):
+        self.assertPasses(self.check("1. 🔴 user: approve\n2. Run the pilot on the base project\n   first (← 1)"))
+
+    def test_BH23_not_checked_without_the_writing_side(self):
+        steps = "1. 🔴 user: approve\n2. Run the pilot"
+        self.assertPasses(self.check(steps, env=False))
+        self.assertPasses(self.check(steps, extra_env={"CLAUDE_CODE_SESSION_ID": A0_SID, "HANDOFF_CALLER": "handoff_state.py"}))
+        plain = set_section(self.base, "Exact Next Step", steps)  # no **Session:** head, no env
+        self.assertPasses(self.run_text(plain))
+
+    def test_BH23_code_is_in_the_vocabulary(self):
+        self.assertIn(self.CODE, load_checker().FAIL_CODES)
+
+
+# --- A: Before Handoff and Reviews gates, own-text quote matching -----------------------------------------
+FIXTURES = ROOT / "tests" / "fixtures" / "transcript"
+BEFORE_SID = "00000000-0000-4000-8000-000000000002"  # before.jsonl
+REVIEWS_SID = "00000000-0000-4000-8000-000000000003"  # reviews.jsonl
+BEFORE_FULL, REVIEWS_FULL = 15, 14
+B1 = "「Plan B」 is the one we keep."  # its quote is short: the whole message is the user's
+B2 = "approve plan 2: run the regression pilot on the base project first, then merge."  # after a table-row quote
+B3 = "Merge after the pilot"  # a dialog answer
+B4 = "what exactly does this condition mean? Explain it, and do the rest as proposed."  # after a pasted quote
+B5 = "Keep it fast: no full suite run until the last step."  # after `>` lines, queued
+G = "record the pilot decision"  # the /handoff arguments
+BEFORE_SHOWN = [f"  - 「{B1}」 (07:00:30Z)", f"  - 「{B2}」 (07:01:00Z)", f"  - 「{B3}」 (07:02:30Z)",
+                f"  - 「{B4}」 (07:03:00Z)", f"  - 「{B5}」 (07:04:00Z)", f"  - 「{G}」 (07:05:00Z)"]
+BEFORE_HEAD = ('[FAIL] {n} user message(s) before the last /handoff are not in "Before Handoff" '
+               "(write - 「…」 → 반영: <section> | 무관):")
+REVIEWS_HEAD = '[FAIL] {n} review run(s) of this session are not in "Reviews" (fill <verdict> and <채택/기각>):'
+R1 = ("a1111111111111111", "demo-tools:critic")
+R2 = ("aplanrev-0123456789abcdef", "demo-tools:code-review")
+W1 = ("wf_0123abcd-4e5", "workflow")
+R2_SHOWN = "  - aplanrev-0123456789abcdef · demo-tools:code-review · <verdict> · <채택/기각>"
+SENTINELS = ("regression pilot", "full suite run", "parser check", "parser plan before", "Plan B", "pilot decision")
+TS = "2026-11-09T07:00:00.000Z"
+HANDOFF_INPUT = "<command-message>handoff</command-message>\n<command-name>/handoff</command-name>"
+LONG_QUOTE = "'│ 4 │ report step │ waiting │ - │ 10 min │ - │ user step │'"  # an assistant table row, 40+ characters
+OWN_LONG = "ship the report after the pilot, not before."  # 40+ characters: a quote before it is cut
+UNREL = ("Go with option B for the parser: keep the old schema, DROP the cache table entirely, and postpone the "
+         "migration until the pilot numbers come back next week.")  # 156 characters
+
+
+def handoff_rec(args=None, ts=TS):
+    """A typed /handoff input, with `<command-args>` when args is not None."""
+    return user_rec(HANDOFF_INPUT + (f"\n<command-args>{args}</command-args>" if args is not None else ""), ts=ts)
+
+
+def skill_rec(ts=TS):
+    return json.dumps({"type": "assistant", "timestamp": ts, "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_demo99", "name": "Skill", "input": {"skill": "demo-tools:handoff"}}]}})
+
+
+def agent_recs(tid, stype, result, ts=TS):
+    """An Agent tool_use and its tool_result record carrying `result` as toolUseResult."""
+    use = {"type": "assistant", "timestamp": ts, "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": tid, "name": "Agent",
+         "input": {"description": "demo", "subagent_type": stype, "prompt": "demo"}}]}}
+    res = {"type": "user", "timestamp": ts, "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": tid, "content": "Launched."}]}, "toolUseResult": result}
+    return [json.dumps(use), json.dumps(res)]
+
+
+class GateCase(SignalCase):
+    sid = BEFORE_SID
+
+    def setUp(self):
+        super().setUp()
+        self.mod = load_checker()
+        self.text = self.base.replace("**Continues:** none", f"**Continues:** none\n**Session:** {self.sid}", 1)
+
+    def put_lines(self, lines, sid=None):
+        folder = self.home / ".claude" / "projects" / "-tmp-demo"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{sid or self.sid}.jsonl"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        return path
+
+    def fixture_lines(self, name, count=None):
+        lines = (FIXTURES / name).read_text(encoding="utf-8").splitlines()
+        return lines if count is None else lines[:count]
+
+    def put_fixture(self, name, count=None, extra=()):
+        return self.put_lines(self.fixture_lines(name, count) + list(extra))
+
+    def section(self, name):
+        return (FIXTURES / name).read_text(encoding="utf-8")
+
+    def gate(self, text, **extra):
+        return self.run_text(text, args=("--git", "yes"), extra_env={"CLAUDE_CODE_SESSION_ID": self.sid, **extra})
+
+    def quoted(self, proc):
+        return [ln for ln in proc.stdout.splitlines() if ln.startswith("  - 「")]
+
+    def heads(self, proc):
+        return [ln for ln in proc.stdout.splitlines() if ln.startswith("[")]
+
+
+class BeforeGateTests(GateCase):
+    def setUp(self):
+        super().setUp()
+        self.put_fixture("before.jsonl", BEFORE_FULL)
+
+    def ok_without(self, quote):
+        lines = self.section("before_ok.md").split("\n")
+        kept = [ln for ln in lines if not ln.startswith(f"- 「{quote}」")]
+        self.assertEqual(len(kept), len(lines) - 1)
+        return self.text + "\n".join(kept)
+
+    def test_BH1_missing_section_fails(self):
+        proc = self.gate(self.text)
+        self.assertFailsWith(proc, '[FAIL] 6 user message(s) before the last /handoff are not in "Before Handoff"')
+        self.assertEqual(self.heads(proc), [BEFORE_HEAD.format(n=6)])
+        self.assertEqual(self.quoted(proc), BEFORE_SHOWN)
+        for start in ("「'", "「>", "「<pasted"):
+            self.assertNotIn(start, proc.stdout)
+        self.assertNotIn("small sample set", proc.stdout)  # the sixth message back is outside the window
+
+    def test_BH2_recorded_passes(self):
+        proc = self.gate(self.text + self.section("before_ok.md"))
+        self.assertPasses(proc)
+        self.assertNotIn("WARNING", proc.stdout)
+
+    def test_BH3_quote_only_fails(self):
+        proc = self.gate(self.text + self.section("before_bypass.md"))
+        self.assertFailsWith(proc, BEFORE_HEAD.format(n=3))
+        self.assertEqual(self.quoted(proc), [BEFORE_SHOWN[1], BEFORE_SHOWN[3], BEFORE_SHOWN[4]])
+
+    def test_BH3b_verbatim_passes(self):
+        self.assertPasses(self.gate(self.text + self.section("before_verbatim.md")))
+
+    def test_BH4_each_incident_alone(self):
+        for quote, shown in ((B2, BEFORE_SHOWN[1]), (B5, BEFORE_SHOWN[4]), (B4, BEFORE_SHOWN[3])):
+            with self.subTest(quote=quote[:20]):
+                proc = self.gate(self.ok_without(quote))
+                self.assertFailsWith(proc, BEFORE_HEAD.format(n=1))
+                self.assertEqual(self.quoted(proc), [shown])
+                self.assertEqual(self.record()["fail_codes"], {"before-handoff": 1})
+
+    def test_BH4b_head_and_tail_of_a_short_message_fail(self):
+        lines = self.fixture_lines("before.jsonl", BEFORE_FULL)
+        rec = json.loads(lines[4])
+        self.assertEqual(rec["message"]["content"], B1)
+        rec["message"]["content"] = UNREL
+        self.put_lines(lines[:4] + [json.dumps(rec)] + lines[5:])
+        ok = self.section("before_ok.md")
+        self.assertIn(f"- 「{B1}」 → 무관", ok)
+        proc = self.gate(self.text + ok.replace(f"- 「{B1}」", f"- 「{UNREL[:40]}…{UNREL[-40:]}」"))
+        self.assertFailsWith(proc, BEFORE_HEAD.format(n=1))
+        self.assertEqual(self.quoted(proc), [f"  - 「{UNREL}」 (07:00:30Z)"])
+        self.assertPasses(self.gate(self.text + ok.replace(f"- 「{B1}」", f"- 「{UNREL}」")))
+
+    def test_BH8_disposition(self):
+        ok = self.section("before_ok.md")
+        line = f"- 「{B3}」 → 반영: Exact Next Step"
+        self.assertIn(line, ok)
+        cases = {"→ 반영: Decisions Made": True, "→ 무관": True, "→ 무관 (잡담)": True,
+                 "→ 반영: Decisions": False, "→ 반영: No Such Section": False, "→ 반영: After Handoff": False,
+                 "→ 반영: Before Handoff": False, "": False, "→ 결정: x": False, "→ 반영:": False}
+        after = "\n## After Handoff\n\n- 「unused」 → 결정: 변경 없음\n"
+        for tail, passes in cases.items():
+            with self.subTest(tail=tail):
+                proc = self.gate(self.text + ok.replace(line, f"- 「{B3}」 {tail}".rstrip()) + after)
+                if passes:
+                    self.assertPasses(proc)
+                else:
+                    self.assertFailsWith(proc, BEFORE_HEAD.format(n=1))
+                    self.assertEqual(self.quoted(proc), [BEFORE_SHOWN[2]])
+
+    def test_BH11_codes_fields_privacy(self):
+        keys = ("after_handoff_lines", "before_handoff_lines", "before_unrelated", "attempt_n", "elapsed_ms",
+                "reviews_found", "reviews_recorded")
+        self.gate(self.text)
+        rec = self.record()
+        self.assertEqual(rec["fail_codes"], {"before-handoff": 6})
+        self.assertEqual({k: rec[k] for k in keys if k != "elapsed_ms"},
+                         {"after_handoff_lines": 0, "before_handoff_lines": 6, "before_unrelated": 0, "attempt_n": 1,
+                          "reviews_found": 0, "reviews_recorded": 0})
+        self.assertIsInstance(rec["elapsed_ms"], int)
+        self.assertGreaterEqual(rec["elapsed_ms"], 0)
+        self.assertPasses(self.gate(self.text + self.section("before_ok.md")))
+        rec = self.record()
+        self.assertEqual((rec["attempt_n"], rec["before_unrelated"], rec["before_handoff_lines"]), (2, 1, 6))
+        for extra in ({"CLAUDE_CODE_SESSION_ID": ""}, {"HANDOFF_CALLER": "handoff_state.py"}):
+            with self.subTest(extra=extra):
+                self.gate(self.text, **extra)
+                self.assertEqual({k: self.record()[k] for k in keys}, dict.fromkeys(keys))
+        raw = (self.tmp / "runs.jsonl").read_text(encoding="utf-8")
+        for sentinel in SENTINELS:
+            self.assertNotIn(sentinel, raw)
+        self.assertEqual({len(json.loads(x)) for x in raw.splitlines()}, {26})
+
+
+class OwnTextTests(GateCase):
+    def own(self, raw):
+        return self.mod.normalize(self.mod.own_text(raw))
+
+    def test_BH5_own_text_table(self):
+        long_q, rest = LONG_QUOTE, OWN_LONG
+        self.assertGreaterEqual(len(long_q), 40)
+        long_c = "「" + "the report step waits for the pilot and one approval" + "」"
+        lines = "> The pilot needs about 60 minutes of runner time.\n> Starting it now blocks the merge lane."
+        pasted = "' <pasted_content id=\"a1b2\"> step 2 │ parser check │ runs after the schema step │'"
+        cases = {
+            "' quote 40+ then text": (f"{long_q} {rest}", rest),
+            "short ' quote": (f"'ok' {rest}", f"'ok' {rest}"),
+            "no closing '": ("'" + long_q[1:-1] + " " + rest, "'" + long_q[1:-1] + " " + rest),
+            "' quote only": (long_q, long_q),
+            "「 quote 40+ then text": (f"{long_c} {rest}", rest),
+            "short 「 quote": (B1, B1),
+            "> lines 40+ then text": (f"{lines}\n{rest}", rest),
+            "> lines only": (lines, " ".join(lines.split())),
+            "short > line": (f"> ok\n{rest}", f"> ok {rest}"),
+            "pasted_content start": (f"<pasted_content id=\"x\"> a table {rest}", f"<pasted_content id=\"x\"> a table {rest}"),
+            "' pasted ' then text": (f"{pasted} {rest}", rest),
+            "plain": (rest, rest),
+            "leading space": (f"  \n {long_q}\n{rest}", rest),
+            "quote then blank": (f"{long_q}   \n ", long_q),
+            "short own text after a quote": (f"{long_q} ship it.", f"{long_q} ship it."),
+        }
+        for name, (raw, want) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.own(raw), want)
+
+    def test_BH5_boundaries(self):
+        rest = OWN_LONG
+        q39, q40 = "'" + "x" * 37 + "'", "'" + "x" * 38 + "'"
+        folded40 = "'" + "y" * 18 + "\n\n\n" + "y" * 19 + "'"  # 42 characters as typed, 40 once its newlines fold
+        folded39 = "'" + "y" * 18 + "\n\n\n" + "y" * 18 + "'"
+        long_q = "'" + "z" * 45 + "'"
+        mark = "이건 '무관'으로 두고 다음 단계로 넘어가 줘. 테스트는 먼저 돌려서 결과를 확인하고 보고해."
+        path = "'/home/demo/projects/sample-app/src/config/settings.py'"
+        cases = {
+            "39-char quote": (q39 + " rest", q39 + " rest"),
+            "39-char quote, long text": (f"{q39} {rest}", f"{q39} {rest}"),
+            "40-char quote, short text": (q40 + " rest", q40 + " rest"),
+            "40-char quote, long text": (f"{q40} {rest}", rest),
+            "40-char own text": (f"{q40} {'w' * 40}", "w" * 40),
+            "39-char own text": (f"{q40} {'w' * 39}", f"{q40} {'w' * 39}"),
+            "39-char own text over lines": (f"{q40}\n{'w' * 19}\n\n{'w' * 19}", f"{q40} {'w' * 19} {'w' * 19}"),
+            "folds to 40": (f"{folded40} {rest}", rest),
+            "folds to 39": (f"{folded39} {rest}", self.mod.normalize(f"{folded39} {rest}")),
+            "quote closes at the first '": (f"{long_q} {mark}", mark),
+            "short text holding quotes": (f"{long_q} 이건 '무관'으로", f"{long_q} 이건 '무관'으로"),
+            "a path, then a short order": (f"{path} 이 파일 지워", f"{path} 이 파일 지워"),
+        }
+        for name, (raw, want) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.own(raw), want)
+        self.assertEqual(self.mod.split_quote(f"{path} 이 파일 지워"), (f"{path} 이 파일 지워", False))
+        self.assertEqual(self.mod.split_quote(f"{q40} {rest}"), (" " + rest, True))
+
+    def test_BH13_read_marks_stripped_quotes(self):
+        said = f"{LONG_QUOTE} {OWN_LONG}"
+        path = self.put_lines([user_rec("first one"), handoff_rec(), user_rec(said, ts="2026-11-09T07:01:00.000Z")])
+        got = self.mod.read_session(path)
+        self.assertEqual(got["after"], [(OWN_LONG, True, "2026-11-09T07:01:00.000Z")])
+        self.assertEqual(got["before"], [("first one", False, TS)])
+        self.assertEqual(self.mod.messages_after_handoff(path), ([(self.mod.normalize(said), "2026-11-09T07:01:00.000Z")], None))
+
+
+class MatchRuleTests(GateCase):
+    def left(self, msg, section, s=False):
+        missing, _ = self.mod.match_quotes([(msg, s, TS)], section)
+        return [t for t, _ in missing]
+
+    def test_BH6_match_rule(self):
+        self.assertEqual(self.left("ok", "- 「ok」 → 결정: 변경 없음"), [])
+        self.assertEqual(self.left("ok", "- 「Ship it after the review」 → 결정: ok로 둔다"), ["ok"])
+        self.assertEqual(self.left("ok", "- 「ok, maybe」 → 결정: 변경 없음"), ["ok"])
+        self.assertEqual(self.left(M1, f"- 「{M1}」 → 결정: 변경 없음"), [])
+        self.assertEqual(self.left(M1, f"- 「{M1[:40]}… 」 → 결정: 변경 없음"), [M1])  # the first 40 alone
+        self.assertEqual(self.left(M1, f"- 「{M1[:40]}…{M1[-40:]}」 → 결정: 변경 없음"), [M1])  # 300 or less: whole
+        self.assertEqual(self.left(UNREL, f"- 「{UNREL[:40]}…{UNREL[-40:]}」 → 결정: 변경 없음"), [UNREL])
+        self.assertEqual(self.left(M1, "- 「다른 줄」 → 결정: " + M1), [M1])  # the last 40 need the closing 」
+        respaced = "- 「Move part C to the\n  second   round and\tship A and B first.」 → 결정: C를 미룸"
+        self.assertEqual(self.left(M1, respaced), [])
+        long = " ".join(f"word{i}" for i in range(80))
+        self.assertGreater(len(long), 500)
+        shown = self.mod.shown_quotes([(long, TS)])[0]
+        self.assertEqual(shown, "「" + long[:259] + "…" + long[-40:] + "」 (07:00:00Z)")
+        self.assertEqual(self.left(long, f"- {shown.rsplit(' (', 1)[0]} → 결정: 변경 없음"), [])
+        self.assertEqual(self.left(long, f"- 「{long[:300]}…」 → 결정: 변경 없음"), [long])  # the -3 cut
+        self.assertEqual(self.left(long, f"- 「…{long[-40:]}」 → 결정: 변경 없음"), [long])  # the last 40 alone
+        self.assertEqual(self.left(long, f"- 「{long[:259]}…{long[-40:]} more」 → 결정: 변경 없음"), [long])  # 」 right after
+        self.assertEqual(self.left(long, f"- 「{long[:258]}…{long[-40:]}」 → 결정: 변경 없음"), [long])
+        self.assertEqual(self.left(long, f"- 「{long[:259]}」 → 결정: {long[-40:]}」"), [])  # one item holds both
+        self.assertEqual(self.left(long, f"- 「{long[:259]}」 → 결정: x\n- 「{long[-40:]}」 → 결정: x"), [long])
+        self.assertEqual(self.left(M2, f"- 「{unicodedata.normalize('NFD', M2)}」 → 결정: 변경 없음"), [])
+        twice = [("yes", False, TS), ("yes", False, "2026-11-09T07:05:00.000Z")]
+        self.assertEqual(self.mod.match_quotes(twice, "- 「yes」 → 결정: x")[0], [("yes", "2026-11-09T07:05:00.000Z")])
+        self.assertEqual(self.mod.match_quotes(twice, "- 「yes」 → 결정: x\n- 「yes」 → 결정: y")[0], [])
+
+    def test_BH6_length_boundaries(self):
+        def sized(n):
+            return ("word " * 80)[:n - 1] + "x"
+        for n in (299, 300):
+            with self.subTest(n=n):
+                m = sized(n)
+                self.assertEqual(len(m), n)
+                self.assertEqual(self.left(m, f"- 「{m[:259]}…{m[-40:]}」 → 결정: x"), [m])
+                self.assertEqual(self.left(m, f"- 「{m}」 → 결정: x"), [])
+        m = sized(301)
+        self.assertEqual(self.left(m, f"- 「{m[:259]}…{m[-40:]}」 → 결정: x"), [])
+        self.assertEqual(self.left(m, f"- 「{m[:259]}…{m[-39:]}」 → 결정: x"), [m])
+        for n in (39, 40):
+            with self.subTest(n=n):
+                m = sized(n)
+                self.assertEqual(self.left(m, f"- 「{m}」 → 결정: x"), [])
+                self.assertEqual(self.left(m, f"- 「다른 줄」 → 결정: 「{m}」"), [] if n == 40 else [m])
+
+    def test_BH6_shown_line_round_trip(self):
+        texts = [("word " * 130)[:n - 1] + "x" for n in (1, 39, 40, 41, 156, 259, 299, 300, 301, 302, 640)]
+        texts += [UNREL, M2, "use 「A」 then 「B」 → done, and keep the old report format for the pilot",
+                  "Do these: - step one of the plan with enough words - step two of the plan with enough words"]
+        titles = {"Decisions Made"}
+        for text in texts:
+            for cut in ((False, True) if len(text) >= 40 else (False,)):
+                with self.subTest(n=len(text), cut=cut):
+                    line = self.mod.quote_line(text, TS)
+                    self.assertEqual(self.mod.match_quotes([(text, cut, TS)], f"- {line} → 반영: Decisions Made",
+                                                           titles), ([], 0))
+                    bare = line.rsplit(" (", 1)[0]
+                    self.assertEqual(self.left(text, f"- {bare} → 결정: 변경 없음", s=cut), [])
+
+    def test_BH6_stripped_quote_own_text(self):
+        n = OWN_LONG
+        self.assertEqual(self.left(n, f"- 「{n}」 → 결정: x", s=True), [])
+        self.assertEqual(self.left(n, f"- 「{LONG_QUOTE} {n}」 → 결정: x", s=True), [])  # the quote along
+        self.assertEqual(self.left(n, f"- 「…{n}」 → 결정: x", s=True), [])
+        self.assertEqual(self.left(n, f"- 「…{n}」 → 결정: x", s=False), [n])
+        self.assertEqual(self.left(n, f"- 「{n[:40]}…{n[-40:]}」 → 결정: x", s=True), [n])
+        self.assertEqual(self.left(n, f"- 「{n[1:]}」 → 결정: x", s=True), [n])
+
+    def test_BH6_multiline_message_needs_the_shown_line(self):
+        raw = "Do these:\n- step one of the plan with enough words\n- step two of the plan with enough words"
+        n = self.mod.normalize(raw)
+        self.assertEqual(self.left(n, f"- 「{raw}」 → 결정: 변경 없음"), [n])  # its list lines split the item
+        self.assertEqual(self.left(n, f"- 「{n}」 → 결정: 변경 없음"), [])
+
+    def test_BH6_moved_after_cases(self):
+        twins = [(M1 + " Then C.", False, TS), (M1 + " Then D.", False, "2026-11-09T07:01:00.000Z")]
+        missing, _ = self.mod.match_quotes(twins, f"- 「{M1}」 → 결정: 변경 없음")
+        self.assertEqual([t for t, _ in missing], [M1 + " Then C.", M1 + " Then D."])
+        both = "".join(f"- 「{t}」 → 결정: 변경 없음\n" for t, _, _ in twins)
+        self.assertEqual(self.mod.match_quotes(twins, both)[0], [])
+        self.assertEqual(self.left("A", "- 「「A」안은 버리고 「B」안으로 가자.」 → 결정: B안"), ["A"])
+        self.assertEqual(self.left("A", "  - 「A」 → 결정: 변경 없음"), [])  # an indented item still opens one
+
+    def test_BH6_short_own_text_keeps_the_quote(self):
+        said = f"{LONG_QUOTE} keep it"
+        got = self.mod.read_session(self.put_lines([user_rec("first one"), handoff_rec(), user_rec(said)]))
+        whole = self.mod.normalize(said)
+        self.assertEqual(got["after"], [(whole, False, TS)])
+        self.assertEqual(self.mod.match_quotes(got["after"], f"- 「{said}」 → 결정: x")[0], [])
+        self.assertEqual(self.mod.match_quotes(got["after"], "- 「keep it」 → 결정: x")[0], [(whole, TS)])
+        self.assertEqual(self.mod.match_quotes(got["after"], f"- 「…{LONG_QUOTE[-30:]} keep it」 → 결정: x")[0],
+                         [(whole, TS)])
+        path = "'/home/demo/projects/sample-app/src/config/settings.py' 이 파일 지워"
+        got = self.mod.read_session(self.put_lines([user_rec("first one"), handoff_rec(), user_rec(path)]))
+        self.assertEqual(got["after"], [(path, False, TS)])
+        self.assertEqual(self.mod.match_quotes(got["after"], "- 「이 파일 지워」 → 결정: x")[0], [(path, TS)])
+        self.assertEqual(self.mod.match_quotes(got["after"], f"- 「{path}」 → 결정: x")[0], [])
+
+
+class WindowTests(GateCase):
+    def read(self, lines):
+        got = self.mod.read_session(self.put_lines(lines))
+        self.assertIsNone(got["msg_reason"])
+        return got
+
+    def texts(self, lines, key="before"):
+        return [t for t, _, _ in self.read(lines)[key]]
+
+    def test_BH7_window(self):
+        msgs = [user_rec(f"message {i}") for i in range(1, 8)]
+        self.assertEqual(self.texts(msgs + [handoff_rec()]), [f"message {i}" for i in range(3, 8)])
+        self.assertEqual(self.texts(msgs[:4] + [handoff_rec()] + msgs[4:] + [handoff_rec()]),
+                         [f"message {i}" for i in range(3, 8)])  # the window runs past the earlier /handoff
+        self.assertEqual(self.texts(msgs[:2] + [handoff_rec()]), ["message 1", "message 2"])
+        self.assertEqual(self.texts(msgs[:2] + [handoff_rec(), user_rec("late")], key="after"), ["late"])
+        self.assertEqual(self.texts(msgs[:1] + [handoff_rec("  keep  the\nplan ")], key="args"), ["keep the plan"])
+        self.assertEqual(self.read(msgs[:1] + [handoff_rec("keep the plan")])["args"], [("keep the plan", False, TS)])
+        for name, last in (("skill", skill_rec()), ("no args", handoff_rec()), ("empty args", handoff_rec("")),
+                           ("blank args", handoff_rec("  ")), ("args of an earlier /handoff", skill_rec())):
+            with self.subTest(case=name):
+                self.assertEqual(self.read(msgs[:1] + [handoff_rec("earlier"), last])["args"], [])
+        noise = [user_rec("meta", isMeta=True), user_rec("system", promptSource="system"),
+                 user_rec("peer", origin={"kind": "peer"}), user_rec("no origin", origin=None),
+                 queued_rec("<task-notification>x</task-notification>", kind="task-notification")]
+        self.assertEqual(self.texts(msgs[:1] + noise + [handoff_rec()]), ["message 1"])
+
+    def test_BH7_baseline_time(self):
+        got = self.read([user_rec("one"), handoff_rec(ts="2026-11-09T07:09:00.000Z")])
+        self.assertEqual(got["baseline_ts"], "2026-11-09T07:09:00.000Z")
+
+
+class AfterQuoteTests(GateCase):
+    sid = SID
+
+    def with_after(self, *quotes):
+        body = "".join(f"- 「{q}」 → 결정: 변경 없음\n" for q in quotes)
+        return self.text + f"\n## Before Handoff\n\n- 「{BEFORE_1}」 → 무관\n\n## After Handoff\n\n{body}"
+
+    def test_BH9_after_gate_quote_strip(self):
+        own = "ship the report after the pilot, not before."
+        self.put_lines(TRANSCRIPT.read_text(encoding="utf-8").splitlines()[:FULL] + [user_rec(f"{LONG_QUOTE} {own}")])
+        proc = self.gate(self.with_after(M1, M2, A1, LONG_QUOTE))  # the quote alone opened the -3 needle
+        self.assertFailsWith(proc, '[FAIL] 1 user message(s) after the last /handoff are not in "After Handoff":')
+        self.assertIn(f"\n  - 「{own}」 (07:00:00Z)\n", proc.stdout)
+        self.assertEqual(self.record()["fail_codes"], {"after-handoff": 1})
+        self.assertPasses(self.gate(self.with_after(M1, M2, A1, own)))
+        self.assertPasses(self.gate(self.with_after(M1, M2, A1, f"{LONG_QUOTE} {own}")))
+
+
+class AttemptPathTests(GateCase):
+    def run_in(self, cwd, arg, **extra):
+        return subprocess.run([sys.executable, str(CHECKER), arg, "--git", "yes"], cwd=cwd, capture_output=True,
+                              text=True, encoding="utf-8", env=self.env(CLAUDE_CODE_SESSION_ID=self.sid, **extra))
+
+    def test_BH61b_relative_path_is_recorded_absolute(self):
+        (self.tmp / "handoff.md").write_text(self.text, encoding="utf-8", newline="\n")
+        other = self.tmp / "elsewhere"
+        other.mkdir()
+        (other / "handoff.md").write_text(self.text, encoding="utf-8", newline="\n")
+        self.run_in(self.tmp, "handoff.md")
+        real = self.tmp.resolve()  # the cwd a process sees
+        self.assertEqual((self.record()["handoff"], self.record()["attempt_n"]), (str(real / "handoff.md"), 1))
+        self.run_in(other, "handoff.md")  # the same name in another folder is another file
+        self.assertEqual((self.record()["handoff"], self.record()["attempt_n"]), (str(real / "elsewhere/handoff.md"), 1))
+        self.run_in(other, str(real / "handoff.md"))
+        self.assertEqual(self.record()["attempt_n"], 2)
+
+    def test_BH61b_unknown_user_keeps_the_record(self):
+        arg = "~nosuchuser-bh61/handoff.md"  # main() stops at the path (exit 2, as in 2026.11.09-3); the record stays
+        proc = self.run_in(self.tmp, arg)
+        self.assertEqual(proc.returncode, 2)
+        self.assertNotIn("run log not written", proc.stderr)
+        rec = self.record()
+        self.assertEqual((rec["handoff"], rec["fail_codes"]), (str(self.tmp.resolve() / arg), {"internal": 1}))
+
+
+class DegradeTests(GateCase):
+    def test_BH10_no_transcript(self):
+        proc = self.gate(self.text)
+        self.assertPasses(proc)
+        self.assertEqual(proc.stdout.splitlines()[-2:], ["WARNING: after-handoff messages not checked: transcript not found",
+                                                         "WARNING: reviews not checked: transcript not found"])
+        self.assertNotIn("before the last /handoff", proc.stdout)
+        self.assertNotIn("review run(s)", proc.stdout)
+
+    def test_BH10_malformed_records(self):
+        bad = ['{"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Agent", "input": "x"}]}}',
+               '{"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Agent", "id": "t9", '
+               '"input": {"subagent_type": 3}}]}}',
+               '{"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Agent", "id": ["t8"], '
+               '"input": {"subagent_type": "demo-tools:critic"}}]}}',
+               '{"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Workflow", "id": "t7"}]}}',
+               '{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t7"}]}, '
+               '"toolUseResult": {"runId": 5}}',
+               '{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": ["t8"]}]}, '
+               '"toolUseResult": {"agentId": "a1"}}',
+               '{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t9"}]}, '
+               '"toolUseResult": ["a list"]}',
+               '{"type": "user", "message": {"content": [{"type": "tool_result"}, "text", 3]}, "toolUseResult": null}',
+               '{"type": "user", "origin": {"kind": "human"}, "message": {"content": "<command-name>/handoff</command-name>'
+               '<command-args>"}, "isMeta": true}',
+               "{not json", '["assistant"]', '"user"']
+        lines = self.fixture_lines("before.jsonl", BEFORE_FULL)
+        self.put_lines(lines[:4] + bad + lines[4:])
+        proc = self.gate(self.text + self.section("before_ok.md"))
+        self.assertPasses(proc)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual([ln for ln in proc.stdout.splitlines() if "WARNING" in ln],
+                         ["WARNING: reviews not checked: runId missing from a Workflow result"])  # t7's runId is 5
+        self.assertEqual(self.mod.read_session(self.put_lines(lines[:4] + bad))["reviews"], [])
+
+    def test_BH10_no_baseline_still_checks_reviews(self):
+        self.sid = REVIEWS_SID
+        self.text = self.text.replace(BEFORE_SID, REVIEWS_SID)
+        self.put_fixture("reviews.jsonl", REVIEWS_FULL - 1)
+        proc = self.gate(self.text + self.section("reviews_missing.md"))
+        self.assertFailsWith(proc, REVIEWS_HEAD.format(n=1))
+        self.assertEqual(proc.stdout.splitlines()[-1],
+                         "WARNING: after-handoff messages not checked: no /handoff input in transcript")
+        self.assertNotIn("reviews not checked", proc.stdout)
+        self.assertNotIn("before the last /handoff", proc.stdout)
+
+    def test_BH10_reader_reasons(self):
+        path = self.put_fixture("reviews.jsonl", REVIEWS_FULL)
+        self.assertEqual(self.mod.read_session(None)["msg_reason"], "transcript not found")
+        self.assertEqual(self.mod.read_session(None)["review_reason"], "transcript not found")
+        with mock.patch.object(self.mod, "TRANSCRIPT_MAX_BYTES", 10):
+            got = self.mod.read_session(path)
+            self.assertEqual((got["msg_reason"], got["review_reason"]), ("transcript too large",) * 2)
+        with mock.patch.object(self.mod, "classify_record", side_effect=TypeError("boom")):
+            got = self.mod.read_session(path)
+            self.assertEqual((got["msg_reason"], got["review_reason"]), ("transcript format unknown",) * 2)
+            self.assertEqual((got["after"], got["before"], got["args"], got["reviews"]), ([], [], [], []))
+        lines = self.fixture_lines("reviews.jsonl", REVIEWS_FULL)
+        got = self.mod.read_session(self.put_lines([ln.replace('"origin"', '"source"') for ln in lines]))
+        self.assertEqual((got["msg_reason"], got["review_reason"]), ("transcript format unknown",) * 2)
+
+    def test_BH10_no_env_matches_base_commit(self):
+        folder = self.tmp / "base"
+        folder.mkdir()
+        for name in ("check_handoff.py", "run_log.py"):
+            proc = subprocess.run(["git", "show", f"{BASE_COMMIT}:scripts/{name}"], cwd=ROOT, capture_output=True)
+            if proc.returncode != 0:
+                self.skipTest(f"base commit {BASE_COMMIT[:7]} is not available")
+            (folder / name).write_bytes(proc.stdout)
+        self.put_fixture("before.jsonl", BEFORE_FULL)
+        for fixture in (VALID, TEMPLATE, PREVIOUS):
+            with self.subTest(fixture=fixture.name):
+                old, new = (subprocess.run([sys.executable, str(script), str(fixture), "--git", "yes"],
+                                           capture_output=True, text=True, encoding="utf-8",
+                                           env=self.env(HANDOFF_LOG="off")) for script in (folder / "check_handoff.py", CHECKER))
+                self.assertEqual((new.returncode, new.stdout), (old.returncode, old.stdout))
+
+
+class OutputOrderTests(GateCase):
+    sid = REVIEWS_SID
+
+    def test_BH12_output_order(self):
+        self.put_fixture("reviews.jsonl", REVIEWS_FULL, [user_rec("Ship the parser fix after the merge.",
+                                                                  ts="2026-11-09T08:10:00.000Z")])
+        text = set_section(self.text, "Environment & Setup Notes", f"Use {TOKEN} here", sep=False)
+        proc = self.gate(text)
+        heads = self.heads(proc)
+        self.assertTrue(heads[0].startswith("[FAIL] 1 secret-like value(s)"), proc.stdout)
+        self.assertEqual(heads[1:], ['[FAIL] 1 user message(s) after the last /handoff are not in "After Handoff":',
+                                     BEFORE_HEAD.format(n=1), REVIEWS_HEAD.format(n=3)])
+        self.assertEqual(self.record()["fail_codes"],
+                         {"secret:github-token": 1, "after-handoff": 1, "before-handoff": 1, "reviews": 3})
+        (self.home / ".claude" / "projects" / "-tmp-demo" / f"{self.sid}.jsonl").unlink()
+        big = self.text.rstrip("\n") + "\n" + "x" * (25 * 1024) + "\n"
+        proc = self.gate(big)
+        self.assertPasses(proc)
+        out = proc.stdout.splitlines()
+        self.assertTrue(out[0].startswith("[PASS]"), proc.stdout)
+        self.assertEqual(out[1:], [f"WARNING: handoff file is {-(-len(big.encode('utf-8')) // 1024)} KiB (over 24 KiB)",
+                                   "WARNING: after-handoff messages not checked: transcript not found",
+                                   "WARNING: reviews not checked: transcript not found"])
+
+
+class InterfaceTests(GateCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.old = base_checker_module(cls)
+
+    def test_BH13_vocab_and_interface(self):
+        for code in ("before-handoff", "reviews", "contract-next-step-deps"):
+            self.assertIn(code, self.mod.FAIL_CODES)
+        for name in ("classify_record", "messages_after_handoff", "unrecorded", "shown_quotes", "after_handoff_check",
+                     "find_transcript"):
+            with self.subTest(name=name):
+                self.assertEqual(str(inspect.signature(getattr(self.mod, name))),
+                                 str(inspect.signature(getattr(self.old, name))))
+        self.assertEqual(self.mod.TRANSCRIPT_MAX_BYTES, self.old.TRANSCRIPT_MAX_BYTES)
+        cases = [([("ok", TS)], "- 「ok」 → 결정: 변경 없음"), ([("ok", TS)], "- 「Ship it after the review」 → 결정: ok로 둔다"),
+                 ([("A", TS)], "  - 「A」 → 결정: 변경 없음"), ([(M1, TS)], f"- 「{M1[:40]}… 」 → 결정: 변경 없음"),
+                 ([(M1 + " Then C.", TS), (M1 + " Then D.", TS)], f"- 「{M1}」 → 결정: 변경 없음")]
+        for msgs, section in cases:
+            with self.subTest(section=section[:30]):
+                self.assertEqual(self.mod.unrecorded(msgs, section), self.old.unrecorded(msgs, section))
+        self.assertEqual(self.mod.unrecorded([("ok", TS)], "- 「ok」 → 결정: 변경 없음"), [])
+        said = f"{LONG_QUOTE} {OWN_LONG}"
+        path = self.put_lines([user_rec("first one"), handoff_rec(), user_rec(said)])
+        self.assertEqual(self.mod.messages_after_handoff(path), self.old.messages_after_handoff(path))
+        self.assertEqual(self.mod.read_session(path)["after"], [(OWN_LONG, True, TS)])
+        before = self.put_lines(self.fixture_lines("before.jsonl", BEFORE_FULL) + [user_rec(said)])
+        self.assertEqual(self.mod.messages_after_handoff(before), self.old.messages_after_handoff(before))
+
+
+class ReviewsGateTests(GateCase):
+    sid = REVIEWS_SID
+
+    def setUp(self):
+        super().setUp()
+        self.put_fixture("reviews.jsonl", REVIEWS_FULL)
+
+    def test_BH14_reviews_gate(self):
+        missing = self.text + self.section("reviews_missing.md")
+        proc = self.gate(missing)
+        self.assertFailsWith(proc, REVIEWS_HEAD.format(n=1))
+        self.assertEqual([ln for ln in proc.stdout.splitlines() if ln.startswith("  - a")], [R2_SHOWN])
+        self.assertEqual(self.record()["fail_codes"], {"reviews": 1})
+        self.assertEqual((self.record()["reviews_found"], self.record()["reviews_recorded"]), (3, 2))
+        pasted = missing.replace("## Reviews\n\n", "## Reviews\n\n" + R2_SHOWN[2:] + "\n", 1)
+        self.assertIn(R2_SHOWN[2:], pasted)
+        self.assertFailsWith(self.gate(pasted), REVIEWS_HEAD.format(n=1))  # the shown line leaves two cells to fill
+        self.assertPasses(self.gate(self.text + self.section("reviews_ok.md")))
+        self.assertEqual((self.record()["reviews_found"], self.record()["reviews_recorded"]), (3, 3))
+        self.assertEqual(self.record()["before_handoff_lines"], 1)
+        raw = (self.tmp / "runs.jsonl").read_text(encoding="utf-8")
+        for sentinel in SENTINELS + ("adopted", "retry cap"):
+            self.assertNotIn(sentinel, raw)
+
+    def test_BH14b_run_id_missing_warns(self):
+        lines = self.fixture_lines("reviews.jsonl", REVIEWS_FULL)
+        flow = [json.loads(ln) for ln in agent_recs("toolu_demo31", "demo-tools:critic", {"status": "async_launched"})]
+        flow[0]["message"]["content"][0].update(name="Workflow", input={"script": "demo"})
+        cases = {"agent": (agent_recs("toolu_demo30", "demo-tools:critic", {"status": "async_launched"}),
+                           "agentId missing from an Agent result"),
+                 "workflow": ([json.dumps(rec) for rec in flow], "runId missing from a Workflow result")}
+        for name, (extra, reason) in cases.items():
+            with self.subTest(case=name):
+                self.put_lines(lines[:-1] + extra + lines[-1:])
+                proc = self.gate(self.text + self.section("reviews_ok.md"))
+                self.assertPasses(proc)
+                self.assertEqual(proc.stdout.splitlines()[-1], f"WARNING: reviews not checked: {reason}")
+                self.assertEqual((self.record()["reviews_found"], self.record()["reviews_recorded"]), (3, 3))
+                proc = self.gate(self.text + self.section("reviews_missing.md"))
+                self.assertFailsWith(proc, REVIEWS_HEAD.format(n=1))
+                self.assertEqual(proc.stdout.splitlines()[-1], f"WARNING: reviews not checked: {reason}")
+        self.put_lines(lines[:-1] + agent_recs("toolu_demo32", "demo-tools:builder", {"status": "async_launched"})
+                       + agent_recs("toolu_demo33", "demo-tools:critic", "Error: could not start") + lines[-1:])
+        self.assertNotIn("WARNING", self.gate(self.text + self.section("reviews_ok.md")).stdout)
+
+    def test_BH15_review_type_table(self):
+        is_review = self.mod.is_review_type
+        for stype in ("demo-tools:critic", "demo-tools:architect", "demo-tools:code-review", "verifier", "peer-judge",
+                      "x:Reviewer", "demo-tools:doc-reviewer", "a:b:critic"):
+            with self.subTest(stype=stype):
+                self.assertTrue(is_review(stype))
+        for stype in ("demo-tools:builder", "explore", "planner", "general", "review:builder", "architects", None, 3, ""):
+            with self.subTest(stype=stype):
+                self.assertFalse(is_review(stype))
+        lines = self.fixture_lines("reviews.jsonl", REVIEWS_FULL)
+        self.assertEqual(self.mod.read_session(self.put_lines(lines))["reviews"], [R1, R2, W1])
+        without_rounds = lines[:5] + lines[7:]  # no SendMessage round
+        self.assertEqual(self.mod.read_session(self.put_lines(without_rounds))["reviews"], [R1, R2, W1])
+        without_reuse = lines[:7] + lines[9:]  # no builder reusing the reviewer's name
+        self.assertEqual(self.mod.read_session(self.put_lines(without_reuse))["reviews"], [R1, R2, W1])
+        twice = lines + agent_recs("toolu_demo20", "demo-tools:critic", {"status": "async_launched", "agentId": R1[0]})
+        self.assertEqual(self.mod.read_session(self.put_lines(twice))["reviews"], [R1, R2, W1])  # an id once
+        failed = lines[:11] + agent_recs("toolu_demo21", "demo-tools:verifier", "Error: could not start")
+        self.assertEqual(self.mod.read_session(self.put_lines(failed))["reviews"], [R1, R2, W1])
+        no_baseline = self.mod.read_session(self.put_lines(lines[:-1]))
+        self.assertEqual((no_baseline["reviews"], no_baseline["review_reason"]), ([R1, R2, W1], None))
+
+    def test_BH16_reviews_row_match(self):
+        left = self.mod.unrecorded_reviews
+        rid = R2[0]
+        cases = {
+            f"- {rid} · demo-tools:code-review · approve · adopted the cap": True,
+            f"- {rid} · demo-tools:code-review · running · not returned yet": True,
+            f"- {rid} · demo-tools:code-review · approve · adopted · and a note": True,
+            f"- {rid} · demo-tools:code-review\n  · approve · adopted the cap": True,
+            f"- {rid} · demo-tools:code-review · approve": False,
+            f"- {rid} · demo-tools:code-review · <verdict> · adopted": False,
+            f"- {rid} · demo-tools:code-review · TBD · adopted": False,
+            f"- {rid} · demo-tools:code-review ·  · adopted": False,
+            f"- {rid} · demo-tools:code-review · approve · [채택/기각]": False,
+            f"- {rid} · demo-tools:code-review · approve · <채택/기각>": False,
+            f"- note on {rid} · demo-tools:code-review · approve · adopted": False,
+            f"- {rid}0 · demo-tools:code-review · approve · adopted": False,
+            f"- {rid[:-1]} · demo-tools:code-review · approve · adopted": False,
+            f"* {rid} · demo-tools:code-review · approve · adopted": False,
+        }
+        for row, recorded in cases.items():
+            with self.subTest(row=row):
+                self.assertEqual(left([R2], row), [] if recorded else [R2])
+        self.assertEqual(left([R1, R2, W1], self.section("reviews_ok.md").split("## Before Handoff")[0]), [])
 
 
 if __name__ == "__main__":

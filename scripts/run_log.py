@@ -7,6 +7,9 @@ indented stdout lines are dropped and only counted (omitted_lines). The only env
 variables read are CLAUDE_CODE_SESSION_ID (kept only when it is a UUID) and HANDOFF_CALLER (kept
 only when it is in CALLERS, and only on a check_handoff.py record); nothing else from the environment
 is recorded.
+The gate counters (after_handoff_lines, before_handoff_lines, before_unrelated, attempt_n, elapsed_ms,
+reviews_found, reviews_recorded) hold integers only: any other value is stored as null, so no
+message or review text can reach the log through them.
 """
 import json
 import os
@@ -14,10 +17,12 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2026.11.09-3"
+VERSION = "2026.11.10-1"
 MAX_BYTES = 5 * 1024 * 1024
 SESSION_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")  # UUID only
 CALLERS = ("handoff_state.py",)
+INT_FIELDS = ("after_handoff_lines", "before_handoff_lines", "before_unrelated", "attempt_n",
+              "elapsed_ms", "reviews_found", "reviews_recorded")
 
 
 def log_path():
@@ -32,7 +37,9 @@ def log_path():
 
 def build_record(*, script, mode, cwd, toplevel, args, exit_code, stdout_lines,
                  handoff=None, cont=None, checker=None, project=None, fail_codes=None,
-                 handoff_bytes=None):
+                 handoff_bytes=None, after_handoff_lines=None, before_handoff_lines=None,
+                 before_unrelated=None, attempt_n=None, elapsed_ms=None, reviews_found=None,
+                 reviews_recorded=None):
     """Record fields of spec section 12 except ts and version, which append_run fills.
 
     Indented stdout lines (checker findings, item excerpts) can quote the handoff body, so they are
@@ -56,7 +63,62 @@ def build_record(*, script, mode, cwd, toplevel, args, exit_code, stdout_lines,
         "project": project,
         "fail_codes": fail_codes,
         "handoff_bytes": handoff_bytes,
+        "after_handoff_lines": integer_or_none(after_handoff_lines),
+        "before_handoff_lines": integer_or_none(before_handoff_lines),
+        "before_unrelated": integer_or_none(before_unrelated),
+        "attempt_n": integer_or_none(attempt_n),
+        "elapsed_ms": integer_or_none(elapsed_ms),
+        "reviews_found": integer_or_none(reviews_found),
+        "reviews_recorded": integer_or_none(reviews_recorded),
     }
+
+
+def integer_or_none(value):
+    """The value when it is an int (bool excluded), else None, so text never lands in an INT_FIELDS key."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def handoff_path(raw):
+    """The handoff path as a run record keeps it: expanduser, then absolute against this process's cwd.
+
+    A `~user` that does not resolve (RuntimeError) is kept unexpanded, so the record is still written.
+    """
+    try:
+        return str(Path(raw).expanduser().absolute())
+    except RuntimeError:
+        return str(Path(raw).absolute())
+
+
+def attempt_number(session_id, handoff):
+    """1 + the earlier direct check_handoff.py runs of this session on this handoff file, or None.
+
+    Paths compare as handoff_path gives them on both sides. 1 when the log file does not exist yet.
+    None when logging is off, the log cannot be read, or session_id or handoff is empty. Lines that do
+    not parse are skipped.
+    """
+    try:
+        path = log_path()
+        if path is None or not session_id or handoff is None:
+            return None
+        if not path.exists():
+            return 1
+        key = handoff_path(handoff)
+        earlier = 0
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                if session_id not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    if (rec["script"] == "check_handoff.py" and rec["caller"] is None
+                            and rec["session_id"] == session_id
+                            and handoff_path(rec["handoff"]) == key):
+                        earlier += 1
+                except (ValueError, KeyError, TypeError):
+                    continue
+        return earlier + 1
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def env_signals(script):

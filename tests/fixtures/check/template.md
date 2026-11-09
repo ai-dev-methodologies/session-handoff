@@ -134,6 +134,15 @@ If none: "No major decisions made this session."
 
 ---
 
+## Reviews
+
+[Optional. Omit when the checker found no review run in this session. One row per review run, in
+launch order; the verdict is the run's last return, `running` while it has not returned.]
+
+- [agent id | runId] · [type] · [final verdict | running] · [adopted or rejected, one line]
+
+---
+
 ## User Assumptions
 
 [Omit when empty. Statements the user made about the system that are not verifiable in the code.
@@ -177,7 +186,11 @@ If none: "No active blockers."
 [The single most important thing to do on resuming, precise enough that no thinking is needed
 to start. If any live item exists, step 1 is to judge it as `/resume-handoff` Step 3 describes
 (returned, running, or lost) before the rest. If genuinely unknown, say so and point at the sections that
-decide the direction.]
+decide the direction. When a numbered step is a 🔴 user step, every later numbered step ends with
+`(독립)` or `(← n)`, as in:
+1. 🔴 [what the user must do]
+2. [a step that waits for step 1] (← 1)
+3. [a step that does not wait] (독립)]
 
 ---
 
@@ -185,6 +198,17 @@ decide the direction.]
 
 [Omit unless the project needs something non-obvious: commands to run it, services that must be
 up, environment variable names that must be set. Names only, never values.]
+
+---
+
+## Before Handoff
+
+[Optional. Omit when the checker lists no message. Right before `## After Handoff`, or last when that
+section is absent. One line per message the user gave right before `/handoff` and per argument of
+`/handoff`, as the checker shows it:]
+
+- 「[the user's own sentence]」 → 반영: [the title of a `## ` section of this file]
+- 「[the user's own sentence]」 → 무관
 
 ---
 

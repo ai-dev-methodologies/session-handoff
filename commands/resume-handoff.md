@@ -44,6 +44,13 @@ line (the commits and changed files since the `**HEAD:**` the file recorded), an
 `Live subagents` (Step 3), after `since handoff:` and before `handoff check:`, at most five lines
 (then `live subagent: … and N more`). Every `WARNING:` it prints is a briefing warning.
 
+When the lean skill's state file `~/.claude/state/lean-mode.json` exists, the script also prints one
+`lean-mode:` line right after the state block (`lean-mode: on (since <UTC time>)`, `lean-mode: off`, or
+`lean-mode: unknown` when the file cannot be read). The mode is project-scoped: the line says `on` only
+when the file's `project` is the current project key, and `lean-mode: off (set for another project)`
+when it is on for another one. When it prints `lean-mode: on`, the resumed session follows the lean
+skill's operating rules. Without the file no line is printed.
+
 When the file's head carries `**Session:** <UUID>`, the script also reads that session's transcript
 and compares the user messages after its last `/handoff` with the file's `## After Handoff` section.
 Each message the section does not quote is unrecorded. The script then prints, right after the
@@ -51,7 +58,7 @@ Each message the section does not quote is unrecorded. The script then prints, r
 
 ```
 WARNING: N user message(s) after the last /handoff are not in the handoff file
-  「<message as the script prints it, cut at 300 characters>」 (HH:MM:SSZ)
+  「<message as the script prints it, over 300 characters: first 259, `…`, last 40>」 (HH:MM:SSZ)
 ```
 
 One indented line per message, at most 5, then `  … and N more`. When the transcript cannot be
@@ -59,6 +66,20 @@ judged, a single `WARNING: after-handoff messages not checked: <reason>` takes t
 `continue:` does not change. A file without the `**Session:**` line, or with `none`, prints neither.
 The indented lines are the user's own words as the script prints them (whitespace folded, secrets
 masked; the time is shown when known): the briefing shows them as they are.
+
+The same transcript also gives the messages the user sent right before the file's last `/handoff`
+input (the last 5) and that input's arguments, at most 6. The script prints them after the lines above
+and before `handoff age:`:
+
+```
+before handoff: N user message(s)
+  「<message as the script prints it>」 (HH:MM:SSZ)
+WARNING: N user message(s) before the last /handoff are not in the handoff file
+```
+
+The WARNING appears when the file's `## Before Handoff` does not record all of them. The block is for
+display only: `continue:` does not change. A file without the `**Session:**` line, or with `none`,
+prints nothing; when the transcript cannot be judged, only the not-checked WARNING above appears.
 
 Read the files named on `user rules file:` and `rules file:` with the `Read` tool before anything
 else (a path printed as `none` is skipped). **Rules apply in the order core, then user, then
@@ -178,6 +199,10 @@ AFTER HANDOFF:
 [each indented message line Step 0 printed, verbatim, marked "not in the file"]
 [each line of the file's `## After Handoff` section, verbatim]  or  none
 
+BEFORE HANDOFF:
+[each indented line Step 0 printed after `before handoff:`, verbatim]
+[each line of the file's `## Before Handoff` section, verbatim]  or  none
+
 GOAL (carried):
 [the carried `Goal` text, verbatim]
 [the carried `Done-when` text, verbatim]
@@ -205,6 +230,9 @@ CONFIRMED WORKING:
 DECIDED (do not relitigate):
 [every "Decisions Made" item]  or  none
 
+REVIEWS:
+[each row of the file's `## Reviews` section as id · type · verdict, at most 10, then `… and N more`]  or  none
+
 REQUIREMENT NOW:
 [the current state from "Requirement Changes"]  or  unchanged
 
@@ -226,6 +254,10 @@ NEXT STEP:
 
 `AFTER HANDOFF:` is later than the file body: when a line there contradicts the body, this block wins.
 The lines marked "not in the file" are the user's latest decisions and win the same way.
+
+`BEFORE HANDOFF:` lines are context, not new orders. When a `무관` line reads as an instruction or a
+decision, point it out in the briefing. An idea that `REVIEWS:` shows as rejected is not proposed again;
+before running the same review again, read that row's transcript (the path rule is in `/handoff` Step 5).
 
 Always show `DO NOT RETRY`, even when it is `none`.
 
@@ -259,7 +291,8 @@ Whenever the `AFTER HANDOFF:` block ends with `… and N more`, do not continue,
   unreadable handoff skipped, ignored argument words, a handoff of another project, a missing or
   failing checker, a rules file section outside the override points, a newer handoff skipped with
   its reason, `N user message(s) after the last /handoff are not in the handoff file` with its
-  quoted lines, `after-handoff messages not checked: <reason>`) and a `handoff check: exit 1` with
+  quoted lines, `N user message(s) before the last /handoff are not in the handoff file`,
+  `after-handoff messages not checked: <reason>`) and a `handoff check: exit 1` with
   its listed problems.
 - Commits since the handoff: `WARNING: <N> commits since the handoff` when N is 10 or more. When the
   recorded commit is not in this repository, the `since handoff:` line reads

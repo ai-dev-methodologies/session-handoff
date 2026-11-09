@@ -31,6 +31,8 @@ NEW_KEYS = ("session_id", "caller", "project", "fail_codes", "handoff_bytes")
 HEADER_RE = re.compile(r"records (\d+) · skipped (\d+) malformed")
 AFTER_KIND = "user messages after the last /handoff not in the handoff file"
 NOT_CHECKED_KIND = "after-handoff messages not checked"
+BEFORE_KIND = "user messages before the last /handoff not in the handoff file"
+REVIEWS_KIND = "reviews not checked"
 S1, S2, S3 = (f"{n}{n}{n}{n}{n}{n}{n}{n}-aaaa-4bbb-8ccc-{n * 12}" for n in "123")  # UUID-shaped session ids
 
 
@@ -297,8 +299,8 @@ class WarningsTest(ReportCase):
 
     def test_R8_warning_kinds_normalized(self):
         self.write([
-            rec(warnings=["WARNING: handoff file is 17 KiB (over 16 KiB)"]),
-            rec(warnings=["WARNING: handoff file is 18 KiB (over 16 KiB)"]),
+            rec(warnings=["WARNING: handoff file is 17 KiB (over 24 KiB)"]),
+            rec(warnings=["WARNING: handoff file is 18 KiB (over 24 KiB)"]),
             resume(warnings=["WARNING: 3 commits since the handoff"]),
             resume(warnings=["WARNING: 12 commits since the handoff"]),
             resume(warnings=["handoff age: 9.0 days  WARNING: handoff is older than 7 days"]),
@@ -330,7 +332,7 @@ class WarningsTest(ReportCase):
 
     def test_R8_every_printed_warning_has_a_kind(self):
         lines = {  # one line per WARNING: format of check_handoff.py and handoff_state.py stdout
-            "WARNING: handoff file is 17 KiB (over 16 KiB)": "handoff file is N KiB",
+            "WARNING: handoff file is 17 KiB (over 24 KiB)": "handoff file is N KiB",
             "WARNING: rules file unreadable: /h/r.md": "rules file unreadable",
             "WARNING: rules file section outside override points: X": "rules file section outside override points",
             "WARNING: rules file section outside override points: … and 2 more": "rules file section outside override points",
@@ -352,6 +354,8 @@ class WarningsTest(ReportCase):
             "WARNING: 2 user message(s) after the last /handoff are not in the handoff file": AFTER_KIND,
             "WARNING: after-handoff messages not checked: transcript not found": NOT_CHECKED_KIND,
             "WARNING: after-handoff messages not checked: checker unavailable": NOT_CHECKED_KIND,
+            "WARNING: 3 user message(s) before the last /handoff are not in the handoff file": BEFORE_KIND,
+            "WARNING: reviews not checked: transcript not found": REVIEWS_KIND,
         }
         for line, kind in lines.items():
             with self.subTest(line=line):
@@ -362,7 +366,7 @@ class WarningsTest(ReportCase):
                 self.assertIsNone(run_report.warning_kind(tail))  # the mid-line forms end the line
 
     def test_R8_warnings_top_10(self):
-        kinds = ["WARNING: handoff file is 17 KiB (over 16 KiB)", "WARNING: rules file unreadable: x",
+        kinds = ["WARNING: handoff file is 17 KiB (over 24 KiB)", "WARNING: rules file unreadable: x",
                  "WARNING: context-budget not run (E)", "WARNING: context-budget gave no line (exit 1)",
                  "WARNING: unreadable handoff skipped: a", "WARNING: newer handoff skipped (empty file): a",
                  "WARNING: 12 commits since the handoff", "WARNING: checker missing (x); y",
@@ -532,6 +536,69 @@ class CheckFailuresTest(ReportCase):
         self.assertIn("first-try pass 0%", text)
 
 
+class UsageAndVersionAttemptsTest(ReportCase):
+    def test_BH40_help_is_usage(self):
+        self.write([
+            resume(mode="handoff", args=["--help"], exit=2), resume(mode="handoff", args=["-h"], exit=2),
+            resume(mode="handoff", args=[], exit=2),
+            resume(mode="handoff", args=["/p"], exit=0), resume(mode="resume", args=["/p", "--resume"], exit=0),
+            rec(args=["--help"], exit=2, fail_codes={"unreadable": 1}), rec(args=["-h"], exit=2, fail_codes=None),
+            rec(args=["--help", "x"], exit=2), rec(args=["/h/a.md", "--git", "yes"], exit=0),
+        ])
+        data = self.data()
+        table = data["runs"]["by_script_mode"]
+        self.assertEqual(table["handoff_state.py/usage"], {"records": 3, "exit": {"2": 3}})
+        self.assertEqual(table["handoff_state.py/handoff"], {"records": 1, "exit": {"0": 1}})
+        self.assertEqual(table["handoff_state.py/resume"], {"records": 1, "exit": {"0": 1}})
+        self.assertEqual(table["check_handoff.py/usage"], {"records": 2, "exit": {"2": 2}})
+        self.assertEqual(table["check_handoff.py/check"]["records"], 2)
+        self.assertEqual(data["check_failures"]["codes"]["usage"], {"runs": 2, "messages": 2})
+        self.assertNotIn("unreadable", data["check_failures"]["codes"])  # the checker records --help as unreadable
+        self.assertIn("usage: runs 2 · messages 2", section(self.text(), "Check failures"))
+        self.assertFalse([ln for ln in section(self.text(), "Check failures") if ln.startswith("unreadable")])
+        runs = "\n".join(section(self.text(), "Runs"))
+        self.assertIn("handoff_state.py/usage: 3", runs)
+        self.assertIn("check_handoff.py/usage: 2", runs)
+        self.assertNotIn("--help", self.text())
+
+    def test_BH41_attempts_by_version(self):
+        def check(version, minute, code):
+            return rec(ts=f"2026-11-09T10:{minute:02d}:00Z", version=version, exit=code, session_id=S1, handoff="/h/a.md")
+        self.write([check("v1", 0, 1), check("v1", 1, 0), check("v2", 2, 0), check("v3", 3, 1),
+                    rec(ts="2026-11-09T10:04:00Z", version=None, exit=0, session_id=S2, handoff="/h/b.md")])
+        failures = self.data()["check_failures"]
+        self.assertEqual(failures["attempts"]["groups"], 2)  # the version-blind count is unchanged
+        self.assertEqual(failures["attempts"]["median"], 1.5)
+        by = {e["version"]: e for e in failures["attempts_by_version"]}
+        self.assertEqual(list(by), ["(none)", "v1", "v2", "v3"])
+        self.assertEqual(by["v1"], {"version": "v1", "groups": 1, "first_try_pass_rate": 0.0, "median": 2, "max": 2,
+                                    "never_passed": 0})
+        self.assertEqual(by["v2"], {"version": "v2", "groups": 1, "first_try_pass_rate": 1.0, "median": 1, "max": 1,
+                                    "never_passed": 0})
+        self.assertEqual(by["v3"], {"version": "v3", "groups": 1, "first_try_pass_rate": 0.0, "median": None, "max": None,
+                                    "never_passed": 1})
+        lines = [ln for ln in section(self.text(), "Check failures") if ln.startswith("attempts v")]
+        self.assertEqual(lines[0], "attempts v1: groups 1 · first-try pass 0% · median 2 · max 2 · never passed 0")
+        self.assertEqual(len(lines), 3)
+
+    def test_BH41b_attempts_by_version_text_is_capped_at_10(self):
+        self.write([rec(version=f"v{i:02d}", session_id=S1, handoff="/h/a.md") for i in range(12)])
+        self.assertEqual(len(self.data()["check_failures"]["attempts_by_version"]), 12)
+        self.assertEqual(len([ln for ln in section(self.text(), "Check failures") if ln.startswith("attempts v")]), 10)
+
+    def test_BH44_warning_kinds(self):
+        self.write([
+            resume(warnings=["WARNING: 2 user message(s) before the last /handoff are not in the handoff file"]),
+            resume(warnings=["WARNING: 6 user message(s) before the last /handoff are not in the handoff file"]),
+            rec(warnings=["WARNING: reviews not checked: transcript not found"]),
+            rec(warnings=["WARNING: reviews not checked: transcript format unknown"]),
+            rec(warnings=["WARNING: reviews not checked: transcript not found extra text"]),
+            rec(warnings=["WARNING: 2 user message(s) before the last /handoff are not in the handoff file with a tail"]),
+        ])
+        kinds = {w["kind"]: w["count"] for w in self.data()["warnings"]}
+        self.assertEqual(kinds, {BEFORE_KIND: 2, REVIEWS_KIND: 3, "other": 1})
+
+
 class ResumeIntervalTest(ReportCase):
     def test_R8_handoff_to_resume_interval(self):
         self.write([
@@ -632,18 +699,48 @@ class ProjectTest(ReportCase):
 
 
 class SizeAndVersionTest(ReportCase):
+    def handoff_path(self, name):
+        return str(self.home / ".claude" / "handoffs" / name)
+
     def test_R8_size_distribution(self):
-        sizes = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 16384, 20000]
-        self.write([rec(handoff_bytes=n) for n in sizes] +
-                   [rec(handoff_bytes=None), rec(handoff_bytes=True), rec(handoff_bytes="9"),
-                    resume(handoff_bytes=500)])
+        sizes = [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 16384, 25000]
+        self.write([rec(handoff_bytes=n, handoff=self.handoff_path(f"{i}.md")) for i, n in enumerate(sizes)] +
+                   [rec(handoff_bytes=None, handoff=self.handoff_path("n.md")),
+                    rec(handoff_bytes=True, handoff=self.handoff_path("t.md")),
+                    rec(handoff_bytes="9", handoff=self.handoff_path("s.md")),
+                    resume(handoff_bytes=500, handoff=self.handoff_path("r.md"))])
         size = self.data()["handoff_size"]
-        self.assertEqual(size, {"n": 10, "min": 1000, "median": 5500, "p90": 16384, "max": 20000,
-                                "over_16_kib": 1})
+        self.assertEqual(size, {"n": 10, "min": 1000, "median": 5500, "p90": 16384, "max": 25000,
+                                "over_24_kib": 1})
         self.assertNotEqual(size["p90"], size["max"])
         line = " ".join(section(self.text(), "Handoff size"))
         self.assertIn("n 10", line)
-        self.assertIn("over 16 KiB 1", line)
+        self.assertIn("over 24 KiB 1", line)
+
+    def test_BH42_size_scope(self):
+        self.write([
+            rec(ts="2026-11-09T10:00:00Z", handoff_bytes=1000, handoff=self.handoff_path("a.md")),
+            rec(ts="2026-11-09T10:01:00Z", handoff_bytes=2000, handoff=self.handoff_path("a.md")),  # a recheck: the last counts
+            rec(handoff_bytes=3000, handoff=self.handoff_path("b.md")),
+            rec(handoff_bytes=4000, handoff=self.handoff_path("c.md"), caller="handoff_state.py"),  # a resume's own check
+            rec(handoff_bytes=5000, handoff="/tmp/demo/h.md"),  # a fixture or scratch path
+            rec(handoff_bytes=5500, handoff=self.handoff_path("sub/x.md")),  # not directly below handoffs/
+            rec(handoff_bytes=5600, handoff=None),
+            rec(handoff_bytes=6000, handoff="~/.claude/handoffs/e.md"),  # ~ is the home folder
+            old(handoff_bytes=7000, handoff=self.handoff_path("o.md")),  # no caller key: not a direct check
+        ])
+        size = self.data()["handoff_size"]
+        self.assertEqual((size["n"], size["min"], size["max"]), (3, 2000, 6000))
+        self.assertEqual(size["median"], 3000)
+
+    def test_BH43_size_limit_24(self):
+        self.write([rec(handoff_bytes=20 * 1024, handoff=self.handoff_path("a.md")),
+                    rec(handoff_bytes=25 * 1024, handoff=self.handoff_path("b.md"))])
+        size = self.data()["handoff_size"]
+        self.assertEqual(size["over_24_kib"], 1)
+        self.assertNotIn("over_16_kib", size)
+        self.assertIn("over 24 KiB 1", " ".join(section(self.text(), "Handoff size")))
+        self.assertNotIn("16 KiB", self.text())
 
     def test_R8_versions_breakdown(self):
         self.write([
@@ -667,7 +764,7 @@ class SizeAndVersionTest(ReportCase):
     def test_R8_runs_breakdown(self):
         self.write([
             rec(exit=0), rec(exit=1), rec(exit=1, caller="handoff_state.py"), old(exit=0),
-            resume(exit=0), resume(exit=1), resume(mode="handoff", exit=0),
+            resume(exit=0), resume(exit=1), resume(mode="handoff", exit=0, args=["/p"]),
         ])
         runs = self.data()["runs"]
         self.assertEqual(runs["by_script_mode"]["check_handoff.py/check"],

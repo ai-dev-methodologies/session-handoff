@@ -246,7 +246,7 @@ class HandoffDocTests(Base):
 
     def test_C5_step5_trim_order_and_protected_list(self):
         step5 = self._step(5)
-        self.has("16 KiB", step5)
+        self.has("24 KiB", step5)
         self.has("`values`", step5)
         order = ["closed items", "What WORKED", "Current State of Files", "`Why`"]
         pos = [step5.lower().find(w.lower()) for w in order]
@@ -260,7 +260,7 @@ class HandoffDocTests(Base):
 
     def test_C14_checker_contract_listed_in_step6(self):
         step6 = self._step(6)
-        for needle in ("Goal (carried)", "**Continues:**", "**HEAD:**", "Closed (pointers)", "16 KiB"):
+        for needle in ("Goal (carried)", "**Continues:**", "**HEAD:**", "Closed (pointers)", "24 KiB"):
             self.has(needle, step6)
         self.lacks("seven fields", step6)
 
@@ -372,7 +372,7 @@ class HandoffDocTests(Base):
     def test_F2_step6_size_warning_follows_the_result_and_limit_is_fixed(self):
         step6 = self._step(6)
         self.matches(r"(?is)WARNING: handoff file is.{0,300}(after|follows|below)[^.]{0,80}result", step6)
-        self.matches(r"(?is)(fixed|always)[^.]{0,40}16 KiB", step6)
+        self.matches(r"(?is)(fixed|always)[^.]{0,40}24 KiB", step6)
         self.matches(r"(?is)`values`[^.]{0,200}(only|just)[^.]{0,120}Step 5", step6)
         self.matches(r"(?is)checker[^.]{0,80}(does not|never) read", step6)
 
@@ -401,7 +401,30 @@ class HandoffDocTests(Base):
         self.matches(r"(?is)only exception\s+to the \"exits 0\" rule; never run `/handoff` again to clear it", self.text)
         self.matches(r"(?is)do not report until it exits 0 \(the one exception: an unmaskable secret", step6)
         self.matches(r"(?is)run `/handoff` again \(never to\s+clear an after-handoff failure", step6)
-        self.matches(r"(?is)not quoted in `## After Handoff` \(each line opens\s+with `- 「`", step6)
+        self.matches(r"(?is)not quoted in `## After Handoff` \(a message under 40\s+characters must open its own `- 「` line;"
+                     r".{0,40}whole quote.{0,80}first 259 characters and its last 40", step6)
+        self.assertNotIn("nested inside another line does not count", self.text)
+
+    def test_BH50_handoff_doc(self):
+        fmt = self._format_block()
+        self.assertLess(fmt.index("## Decisions Made"), fmt.index("## Reviews"))
+        self.assertLess(fmt.index("## Reviews"), fmt.index("## User Assumptions"))
+        self.assertLess(fmt.index("## Environment & Setup Notes"), fmt.index("## Before Handoff"))
+        self.assertLess(fmt.index("## Before Handoff"), fmt.index("## After Handoff"))
+        for needle in ("→ 반영:", "→ 무관", "running"):
+            self.has(needle, fmt)
+        self.matches(r"- \[[^\]\n]+\] · \[[^\]\n]+\] · \[[^\]\n]*running[^\]\n]*\] · \[[^\]\n]+\]", fmt)
+        for needle in ("🔴", "(독립)", "(← "):
+            self.has(needle, fmt)
+        step5 = self._step(5)
+        for needle in ("## Before Handoff", "## Reviews", "the lines the checker shows", "subagents/agent-<id>.jsonl",
+                       "subagents/workflows/<runId>/", "`반영: <section title>`", "24 KiB"):
+            self.has(needle, step5)
+        step6 = self._step(6)
+        for needle in ("before-handoff", "reviews", "contract-next-step-deps", "24 KiB", "(missing: ",
+                       '- … — what: … · why: "…" · how: …', "- 1 items closed → <history file> (keys: <id>)"):
+            self.has(needle, step6)
+        self.matches(r"(?is)Resume: ready.{0,2000}## Before Handoff.{0,600}## Reviews", step6)
 
 
 class ResumeDocTests(Base):
@@ -596,8 +619,8 @@ class ResumeDocTests(Base):
     def test_F3_warnings_list_has_newer_skipped_and_no_size_warning(self):
         warnings = self.text.split("## Warnings to include in the briefing", 1)[1].split("\n## ", 1)[0]
         self.has("newer handoff skipped", warnings)
-        self.lacks("16 KiB", warnings)
-        self.lacks("over 16", warnings)
+        for needle in ("16 KiB", "over 16", "24 KiB", "over 24"):
+            self.lacks(needle, warnings)
 
     def test_F4_briefing_goal_block_shows_constraints_verbatim(self):
         goal = self._briefing_block().split("GOAL (carried):", 1)[1].split("BLOCKERS / OPEN QUESTIONS:", 1)[0]
@@ -605,6 +628,27 @@ class ResumeDocTests(Base):
         self.matches(r"`Constraints`[^\n]*verbatim", goal)
         self.assertLess(goal.index("`Done-when`"), goal.index("`Constraints`"))
         self.assertLess(goal.index("`Constraints`"), goal.index("What We Are Building"))
+
+    def test_BH51_resume_doc(self):
+        def steps_0_3(text):
+            return text.split("#### What Steps 0–3 do", 1)[1].split("### Step 1", 1)[0]
+
+        base = subprocess.run(["git", "show", "0970c23:commands/resume-handoff.md"], cwd=ROOT, capture_output=True)
+        if base.returncode != 0:
+            self.skipTest("commit 0970c23 is not available")
+        self.assertEqual(steps_0_3(base.stdout.decode("utf-8")).encode("utf-8"), steps_0_3(self.text).encode("utf-8"))
+        block = self._briefing_block()
+        self.assertLess(block.index("AFTER HANDOFF:"), block.index("BEFORE HANDOFF:"))
+        self.assertLess(block.index("BEFORE HANDOFF:"), block.index("GOAL (carried):"))
+        self.assertLess(block.index("DECIDED (do not relitigate):"), block.index("REVIEWS:"))
+        self.assertLess(block.index("REVIEWS:"), block.index("REQUIREMENT NOW:"))
+        step0 = self.text.split("### Step 0", 1)[1].split("#### What Steps 0–3 do", 1)[0]
+        self.has("before handoff: N user message(s)", step0)
+        self.has("WARNING: N user message(s) before the last /handoff are not in the handoff file", step0)
+        self.matches(r"(?is)`무관`[^.]{0,120}(instruction|decision)[^.]{0,120}briefing")
+        self.matches(r"(?is)`REVIEWS:`[^.]{0,200}rejected[^.]{0,120}not propose[^.]{0,120}transcript")
+        warnings = self.text.split("## Warnings to include in the briefing", 1)[1].split("\n## ", 1)[0]
+        self.has("before the last /handoff are not in the handoff file", warnings)
 
     def test_AH31_resume_doc(self):
         def steps_0_3(text):
@@ -1058,7 +1102,23 @@ class RunReportDocTests(unittest.TestCase):
         change = read(CHANGELOG).split("## [2026.11.09-3]", 1)
         self.assertEqual(2, len(change), "CHANGELOG lacks 2026.11.09-3")
         self.assertIn("after-handoff", change[1].split("\n## [", 1)[0])
-        self.assertTrue(read(CHANGELOG).split("## [", 1)[1].startswith("2026.11.09-3]"))
+        self.assertTrue(read(CHANGELOG).split("## [", 1)[1].startswith("2026.11.10-1]"))
+
+    def test_BH52_readmes_changelog(self):
+        for name, text in (("README.md", self.en), ("README.ko.md", self.ko)):
+            for needle in ("Before Handoff", "Reviews", "before-handoff", "reviews", "contract-next-step-deps",
+                           "24 KiB", "over_24_kib", "before handoff:", "elapsed_ms", "attempt_n"):
+                self.assertIn(needle, text, f"{name} lacks {needle}")
+        self.assertIn("26 keys", self.en)
+        self.assertIn("키 26개", self.ko)
+        self.assertNotIn("19 keys", self.en)
+        self.assertNotIn("키 19개", self.ko)
+        top = read(CHANGELOG).split("## [", 2)[1]
+        self.assertTrue(top.startswith("2026.11.10-1] - 2026-11-10"))
+        for needle in ("`## Before Handoff`", "`## Reviews`", "before-handoff", "reviews", "contract-next-step-deps",
+                       "(missing: ", "(over 24 KiB)", "over_24_kib", "handoff_state.py/usage", "attempts_by_version"):
+            self.assertIn(needle, top, f"CHANGELOG 2026.11.10-1 lacks {needle}")
+        self.assertRegex(top, r"(?i)exception")
 
     def test_R9_report_call_only_in_notes(self):
         resume_notes = self.resume.split("\n## Notes", 1)[1]
@@ -1180,6 +1240,15 @@ class PublicScanTests(unittest.TestCase):
         for expected in ("README.md", "README.ko.md", "commands/handoff.md", "docs/field-map.md", "tests/test_docs.py"):
             self.assertIn(expected, names)
         self.assertFalse([n for n in names if n.startswith("scratch/")])
+
+    def test_BH53_new_files_are_scanned(self):
+        names = {p.relative_to(ROOT).as_posix() for p in tracked_files()}
+        for expected in ("scripts/run_report.py", "tests/fixtures/transcript/before.jsonl",
+                         "tests/fixtures/transcript/before_ok.md", "tests/fixtures/transcript/reviews.jsonl",
+                         "tests/fixtures/transcript/reviews_ok.md", "CHANGELOG.md"):
+            self.assertIn(expected, names)
+        text = (ROOT / "tests" / "fixtures" / "transcript" / "reviews.jsonl").read_text(encoding="utf-8")
+        self.assertIn("demo-tools:", text)
 
     def test_A9_no_forbidden_strings(self):
         found = []

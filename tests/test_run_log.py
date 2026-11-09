@@ -23,7 +23,13 @@ FIELDS = {
     "ts", "script", "version", "mode", "cwd", "toplevel", "args", "exit",
     "stdout", "omitted_lines", "warnings", "handoff", "continue", "checker",
     "session_id", "caller", "project", "fail_codes", "handoff_bytes",
+    "after_handoff_lines", "before_handoff_lines", "before_unrelated", "attempt_n",
+    "elapsed_ms", "reviews_found", "reviews_recorded",
 }
+NEW_INT_KEYS = (
+    "after_handoff_lines", "before_handoff_lines", "before_unrelated", "attempt_n",
+    "elapsed_ms", "reviews_found", "reviews_recorded",
+)
 
 
 def sample_record(**over):
@@ -336,7 +342,121 @@ class SignalFieldsTest(RunLogTestCase):
 
     def test_R4_version_format(self):
         self.assertRegex(run_log.VERSION, r"^\d{4}\.\d{2}\.\d{2}-\d+$")
-        self.assertEqual(run_log.VERSION, "2026.11.09-3")
+        self.assertEqual(run_log.VERSION, "2026.11.10-1")
+
+
+class IntegerFieldsTest(RunLogTestCase):
+    def written(self, record):
+        self.assertIsNone(run_log.append_run(record))
+        return json.loads(self.lines(self.default_log)[-1])
+
+    def test_BH60_record_keys(self):
+        self.assertEqual(len(FIELDS), 26)
+        record = sample_record()
+        self.assertEqual(len(record) + 4, 26)  # ts, version, session_id, caller come from append_run
+        for key in NEW_INT_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, record)
+                self.assertIsNone(record[key])
+        self.assertEqual(set(self.written(record)), FIELDS)
+
+    def test_BH60_new_fields_pass_integers_through(self):
+        values = {key: n for n, key in enumerate(NEW_INT_KEYS)}
+        record = sample_record(**values)
+        for key, n in values.items():
+            self.assertEqual(record[key], n)
+        written = self.written(record)
+        for key, n in values.items():
+            self.assertEqual(written[key], n)
+
+    def test_BH60_only_integers_are_accepted(self):
+        for bad in ("quoted user sentence", "3", 1.5, True, False, [1], {"a": 1}, b"1"):
+            for key in NEW_INT_KEYS:
+                with self.subTest(key=key, value=bad):
+                    self.assertIsNone(sample_record(**{key: bad})[key])
+        self.assertNotIn("quoted user sentence",
+                         json.dumps(self.written(sample_record(reviews_found="quoted user sentence"))))
+        self.assertEqual(sample_record(attempt_n=0)["attempt_n"], 0)
+
+
+class AttemptNumberTest(RunLogTestCase):
+    SESSION = "0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"
+    OTHER = "99999999-4f50-4a6b-8c7d-9e0f1a2b3c4d"
+
+    def put_check(self, handoff, session=SESSION, script="check_handoff.py", caller=None):
+        env = {"CLAUDE_CODE_SESSION_ID": session}
+        if caller:
+            env["HANDOFF_CALLER"] = caller
+        with mock.patch.dict(os.environ, env):
+            self.assertIsNone(run_log.append_run(sample_record(script=script, mode="check", handoff=handoff)))
+
+    def test_BH61_missing_log_file_is_first_attempt(self):
+        self.assertFalse(self.default_log.exists())
+        self.assertEqual(run_log.attempt_number(self.SESSION, "/h/a.md"), 1)
+
+    def test_BH61_logging_off_is_null(self):
+        self.put_check("/h/a.md")
+        os.environ["HANDOFF_LOG"] = "off"
+        self.assertIsNone(run_log.attempt_number(self.SESSION, "/h/a.md"))
+
+    def test_BH61_unreadable_log_is_null(self):
+        os.environ["HANDOFF_LOG"] = str(self.tmp)  # a folder, not a file
+        self.assertIsNone(run_log.attempt_number(self.SESSION, "/h/a.md"))
+
+    def test_BH61_missing_session_is_null(self):
+        self.put_check("/h/a.md")
+        self.assertIsNone(run_log.attempt_number(None, "/h/a.md"))
+        self.assertIsNone(run_log.attempt_number("", "/h/a.md"))
+
+    def test_BH61_counts_earlier_direct_checks_plus_one(self):
+        self.put_check("/h/a.md")
+        self.assertEqual(run_log.attempt_number(self.SESSION, "/h/a.md"), 2)
+        self.put_check("/h/a.md")
+        self.assertEqual(run_log.attempt_number(self.SESSION, "/h/a.md"), 3)
+
+    def test_BH61_broken_and_foreign_lines_are_ignored(self):
+        self.put_check("/h/a.md")
+        with self.default_log.open("a", encoding="utf-8", newline="\n") as f:
+            f.write("{not json " + self.SESSION + "\n")
+            f.write("[1, 2, \"" + self.SESSION + "\"]\n")
+            f.write(json.dumps({"session_id": self.SESSION, "script": "check_handoff.py", "caller": None,
+                                "handoff": 5}) + "\n")
+            f.write("\n")
+        self.assertEqual(run_log.attempt_number(self.SESSION, "/h/a.md"), 2)
+
+    def test_BH61_tilde_and_expanded_path_are_one_key(self):
+        self.put_check("~/x.md")
+        self.put_check(str(self.home / "x.md"))
+        self.assertEqual(run_log.attempt_number(self.SESSION, "~/x.md"), 3)
+        self.assertEqual(run_log.attempt_number(self.SESSION, str(self.home / "x.md")), 3)
+        self.assertEqual(run_log.attempt_number(self.SESSION, self.home / "x.md"), 3)
+
+    def test_BH61_other_path_session_script_and_caller_are_not_counted(self):
+        self.put_check("/h/other.md")
+        self.put_check("/h/a.md", session=self.OTHER)
+        self.put_check("/h/a.md", script="handoff_state.py")
+        self.put_check("/h/a.md", caller="handoff_state.py")
+        self.assertEqual(run_log.attempt_number(self.SESSION, "/h/a.md"), 1)
+        self.assertEqual(run_log.attempt_number(self.SESSION, "/h/other.md"), 2)
+
+    def test_BH61_unknown_user_counts_and_never_raises(self):
+        self.put_check("~nosuchuser-bh61/x.md")
+        self.put_check("/h/a.md")
+        self.assertEqual(run_log.attempt_number(self.SESSION, "~nosuchuser-bh61/x.md"), 2)
+        self.assertEqual(run_log.attempt_number(self.SESSION, "/h/a.md"), 2)
+
+    def test_BH61_handoff_path(self):
+        self.assertEqual(run_log.handoff_path("~/x.md"), str(self.home / "x.md"))
+        self.assertEqual(run_log.handoff_path("/h/a.md"), "/h/a.md")
+        self.assertEqual(run_log.handoff_path("rel/a.md"), str(Path.cwd() / "rel" / "a.md"))
+        self.assertEqual(run_log.handoff_path("~nosuchuser-bh61/x.md"), str(Path.cwd() / "~nosuchuser-bh61" / "x.md"))
+
+    def test_BH61_never_raises(self):
+        self.put_check("/h/a.md")
+        self.assertIsNone(run_log.attempt_number(self.SESSION, None))
+        run_log.attempt_number(self.SESSION, "\0bad")  # must not raise
+        self.default_log.write_bytes(b"\xff\xfe" + self.SESSION.encode() + b"\n")
+        self.assertIsNone(run_log.attempt_number(self.SESSION, "/h/a.md"))
 
 
 if __name__ == "__main__":

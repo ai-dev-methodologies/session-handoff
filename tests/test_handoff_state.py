@@ -1089,8 +1089,8 @@ class SizeWarningHiddenTests(StateTestCase):
         self.assertNotIn("more", out)
 
     def test_F2_checker_run_record_keeps_the_size_warning(self):
-        text = self.valid_handoff_text() + "\n" + "padding line that only adds size\n" * 600
-        self.assertGreater(len(text.encode("utf-8")), 16 * 1024)
+        text = self.valid_handoff_text() + "\n" + "padding line that only adds size\n" * 800
+        self.assertGreater(len(text.encode("utf-8")), 24 * 1024)
         self.write_handoff("2026-11-01-work-session.tmp", text)
         proc = self.run_state("--resume")
         self.assertNotIn(self.SIZE, self.combined(proc))
@@ -1784,6 +1784,10 @@ CUT_BEFORE, FULL = 25, 35  # fixture line counts: before M1·M2 are delivered, e
 GATE_BASE = "1c6bbeb"  # handoff_state.py and check_handoff.py before the after-handoff gate
 UNRECORDED = "no (unrecorded messages after handoff)"
 NOT_CHECKED = "WARNING: after-handoff messages not checked: "
+BEFORE_TRANSCRIPT = Path(__file__).resolve().parent / "fixtures" / "transcript" / "before.jsonl"
+BEFORE_OK = Path(__file__).resolve().parent / "fixtures" / "transcript" / "before_ok.md"
+SID2 = "00000000-0000-4000-8000-000000000002"  # before.jsonl's session id
+RELEASE_BASE = "0970c23"  # the release before the Before Handoff gate
 
 
 def put_transcript(home, count, extra=()):
@@ -1812,13 +1816,13 @@ def image_queued_line(text):
                       ensure_ascii=False)
 
 
-def base_scripts(folder, names=("handoff_state.py", "check_handoff.py", "run_log.py")):
-    """Write the GATE_BASE copies of `names` into `folder`; raise SkipTest when git or the commit is missing."""
+def base_scripts(folder, names=("handoff_state.py", "check_handoff.py", "run_log.py"), commit=GATE_BASE):
+    """Write the `commit` copies of `names` into `folder`; raise SkipTest when git or the commit is missing."""
     folder.mkdir(parents=True, exist_ok=True)
     for name in names:
-        proc = subprocess.run(["git", "show", f"{GATE_BASE}:scripts/{name}"], cwd=ROOT, capture_output=True)
+        proc = subprocess.run(["git", "show", f"{commit}:scripts/{name}"], cwd=ROOT, capture_output=True)
         if proc.returncode != 0:
-            raise unittest.SkipTest(f"base commit {GATE_BASE} is not available")
+            raise unittest.SkipTest(f"base commit {commit} is not available")
         (folder / name).write_bytes(proc.stdout)
     return folder
 
@@ -2015,7 +2019,391 @@ class ResumeGateTests(StateTestCase):
         (rec,) = [r for r in recs if r["script"] == "handoff_state.py"]
         self.assertEqual(rec["continue"], UNRECORDED)
         self.assertIn("WARNING: 1 user message(s) after the last /handoff are not in the handoff file", rec["warnings"])
-        self.assertEqual({len(r) for r in recs}, {19})
+        self.assertEqual({len(r) for r in recs}, {26})
+
+
+class ResumeBeforeTests(StateTestCase):
+    """The resume briefing's BEFORE HANDOFF block (new-format-spec section 21). Display only: `continue:` is
+    decided by the after gate alone."""
+
+    BEFORE_FIRST = "  「「Plan B」 is the one we keep.」 (07:00:30Z)"
+    BEFORE_LAST = "  「record the pilot decision」 (07:05:00Z)"
+    MISSING = "WARNING: {n} user message(s) before the last /handoff are not in the handoff file"
+
+    def setUp(self):
+        super().setUp()
+        self.init_repo({"a.txt": "a\n"})
+        self.log = self.tmp / "runs.jsonl"
+
+    def put(self, count=15, extra=()):
+        lines = BEFORE_TRANSCRIPT.read_text(encoding="utf-8").splitlines()[:count] + list(extra)
+        folder = self.home / ".claude" / "projects" / "-tmp-demo"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{SID2}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+    def handoff(self, section=True, session=SID2):
+        text = self.valid_handoff_text().replace("**Continues:** none", f"**Continues:** none\n**Session:** {session}", 1)
+        if section:
+            text += BEFORE_OK.read_text(encoding="utf-8")
+        self.write_handoff("2026-11-01-work-session.tmp", text)
+
+    def resume(self, *args):
+        proc = self.run_state("--resume", *args)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        return proc
+
+    def block(self, proc):
+        """The `before handoff:` line and the indented lines right after it."""
+        out = proc.stdout.splitlines()
+        i = next((n for n, ln in enumerate(out) if ln.startswith("before handoff:")), None)
+        self.assertIsNotNone(i, f"no before handoff line:\n{proc.stdout}")
+        j = i + 1
+        while j < len(out) and out[j].startswith("  「"):
+            j += 1
+        return out[i:j]
+
+    def test_BH30_resume_before_block(self):
+        self.put()
+        self.handoff()
+        proc = self.resume("--c")
+        self.assertEqual(self.lines_with(proc.stdout, "continue:"), ["continue: yes (--c)"], proc.stdout)
+        block = self.block(proc)
+        self.assertEqual(block[0], "before handoff: 6 user message(s)")
+        self.assertEqual(len(block), 7, proc.stdout)
+        self.assertEqual((block[1], block[6]), (self.BEFORE_FIRST, self.BEFORE_LAST), proc.stdout)
+        for ln in block[1:]:
+            self.assertFalse(ln.startswith(("  「'", "  「>", "  「<pasted")), ln)
+        self.assertNotIn("before the last /handoff", proc.stdout)
+        self.assertNotIn("not checked", proc.stdout)
+
+    def test_BH31_resume_before_missing(self):
+        self.put()
+        self.handoff(section=False)
+        proc = self.resume("--c")
+        self.assertEqual(self.lines_with(proc.stdout, "continue:"), ["continue: yes (--c)"], proc.stdout)
+        self.assertEqual(len(self.block(proc)), 7, proc.stdout)
+        self.assertEqual(self.lines_with(proc.stdout, "WARNING: 6 user message(s) before"),
+                         [self.MISSING.format(n=6)], proc.stdout)
+        self.assertEqual(self.lines_with(proc.stdout, "continue:"), ["continue: yes (--c)"])
+
+    def test_BH32_order(self):
+        extra = [json.dumps({"type": "user", "timestamp": "2026-11-09T07:09:00.000Z", "cwd": "/tmp/demo", "gitBranch": "main",
+                             "sessionId": SID2, "origin": {"kind": "human"},
+                             "message": {"role": "user", "content": M3}}, ensure_ascii=False)]
+        self.put(extra=extra)
+        self.handoff()
+        proc = self.resume("--c")
+        self.assertEqual(self.lines_with(proc.stdout, "continue:"), [f"continue: {UNRECORDED}"], proc.stdout)
+        out = proc.stdout.splitlines()
+        where = [next(n for n, ln in enumerate(out) if ln.startswith(prefix)) for prefix in
+                 ("handoff: ", "WARNING: 1 user message(s) after the last /handoff", "before handoff:", "handoff age:")]
+        self.assertEqual(where, sorted(where), proc.stdout)
+        self.assertEqual(out[where[1] + 1], f"  「{M3}」 (07:09:00Z)", proc.stdout)
+
+    def test_BH33_degrade(self):
+        self.handoff()
+        proc = self.resume("--c")  # no transcript
+        self.assertEqual(self.lines_with(proc.stdout, "continue:"), ["continue: yes (--c)"])
+        self.assertEqual(self.lines_with(proc.stdout, NOT_CHECKED), [NOT_CHECKED + "transcript not found"], proc.stdout)
+        self.assertEqual(self.lines_with(proc.stdout, "before handoff:"), [], proc.stdout)
+        self.assertNotIn("before the last /handoff", proc.stdout)
+        self.put()
+        folder = base_scripts(self.tmp / "mixed", names=("check_handoff.py",), commit=RELEASE_BASE)
+        for name in ("handoff_state.py", "run_log.py"):
+            (folder / name).write_bytes((ROOT / "scripts" / name).read_bytes())
+        proc = subprocess.run([sys.executable, str(folder / "handoff_state.py"), str(self.repo), "--resume", "--c"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              env=self.env(), cwd=str(self.tmp))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(self.lines_with(proc.stdout, "continue:"), ["continue: yes (--c)"], proc.stdout)
+        self.assertEqual(self.lines_with(proc.stdout, NOT_CHECKED), [NOT_CHECKED + "checker unavailable"], proc.stdout)
+        self.assertEqual(self.lines_with(proc.stdout, "before handoff:"), [], proc.stdout)
+
+    def test_BH34_old_handoff_unchanged(self):
+        old = base_scripts(self.tmp / "old", commit=RELEASE_BASE)
+        self.put()
+        cases = {"no Session line": self.valid_handoff_text(),
+                 "Session none": self.valid_handoff_text().replace("**Continues:** none", "**Continues:** none\n**Session:** none", 1)}
+        for label, text in cases.items():
+            for env in ({}, {"CLAUDE_CODE_SESSION_ID": SID2}):
+                with self.subTest(case=label, env=bool(env)):
+                    self.write_handoff("2026-11-01-work-session.tmp", text)
+                    runs = [subprocess.run([sys.executable, str(script), str(self.repo), "--resume", "--c"],
+                                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                           env=self.env(HANDOFF_LOG="off", **env), cwd=str(self.tmp))
+                            for script in (old / "handoff_state.py", SCRIPT)]
+                    self.assertEqual((runs[1].returncode, runs[1].stdout), (runs[0].returncode, runs[0].stdout))
+
+    def test_BH35_privacy(self):
+        self.put()
+        self.handoff(section=False)
+        self.resume("--c")
+        log = self.log.read_text(encoding="utf-8")
+        for sentinel in ("regression pilot", "full suite run", "parser check", "Plan B", "pilot decision"):
+            self.assertNotIn(sentinel, log)
+        recs = [json.loads(ln) for ln in log.splitlines()]
+        (rec,) = [r for r in recs if r["script"] == "handoff_state.py"]
+        self.assertIn(self.MISSING.format(n=6), rec["warnings"])
+        self.assertEqual(rec["continue"], "yes (--c)")
+        self.assertEqual({len(r) for r in recs}, {26})
+
+    def test_BH36_default_handoff_field(self):
+        old = base_scripts(self.tmp / "old", commit=RELEASE_BASE)
+        path = self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        proc = self.run_state()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        (shown,) = self.lines_with(proc.stdout, "previous handoff: ")
+        self.assertEqual(shown, f"previous handoff: {path}")
+        recs = [json.loads(ln) for ln in self.log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([r["handoff"] for r in recs], [str(path)])
+        before = subprocess.run([sys.executable, str(old / "handoff_state.py"), str(self.repo)], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", env=self.env(HANDOFF_LOG="off"),
+                                cwd=str(self.tmp))
+        self.assertEqual((proc.returncode, proc.stdout), (before.returncode, before.stdout))
+        path.unlink()
+        self.run_state()
+        recs = [json.loads(ln) for ln in self.log.read_text(encoding="utf-8").splitlines()]
+        self.assertIsNone(recs[-1]["handoff"])
+        self.assertIn("previous handoff: none", self.run_state().stdout)
+
+
+# --- lean-mode: one line from ~/.claude/state/lean-mode.json ------------------------------------------
+class LeanModeTests(StateTestCase):
+    PREFIX = "lean-mode:"
+    SINCE = "2026-11-10T01:02:03Z"
+    SECRET = "/synthetic/private/project-dir"
+
+    def setUp(self):
+        super().setUp()
+        self.init_repo({"a.txt": "a\n"})
+        self.log = self.tmp / "runs.jsonl"
+        self.state_dir = self.home / ".claude" / "state"
+        self.lean = self.state_dir / "lean-mode.json"
+
+    def put(self, data):
+        """Write the state file; `data` is a dict (dumped as JSON), str, or bytes (written as is)."""
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        if isinstance(data, dict):
+            data = json.dumps(data)
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self.lean.write_bytes(data)
+
+    def on(self, **extra):
+        """`on: true` for this test's own project unless `project=` says otherwise."""
+        self.put({"on": True, "since": self.SINCE, "project": self.repo.as_posix(), **extra})
+
+    def lean_lines(self, proc):
+        return self.lines_with(proc.stdout, self.PREFIX)
+
+    def test_on_prints_since_in_default_mode(self):
+        self.on()
+        proc = self.run_state()
+        self.assertEqual(proc.returncode, 0, self.combined(proc))
+        self.assertEqual(self.lean_lines(proc), [f"lean-mode: on (since {self.SINCE})"], proc.stdout)
+
+    def test_off_prints_off(self):
+        self.put({"on": False})
+        proc = self.run_state()
+        self.assertEqual(self.lean_lines(proc), ["lean-mode: off"], proc.stdout)
+        self.put({"on": False, "since": self.SINCE, "project": self.SECRET})
+        self.assertEqual(self.lean_lines(self.run_state()), ["lean-mode: off"])
+
+    def test_line_sits_between_session_lines_and_budget(self):
+        budget = self.home / ".claude" / "scripts" / "context_budget.py"
+        budget.parent.mkdir(parents=True)
+        budget.write_text("print('budget 42%')\n", encoding="utf-8")
+        self.on()
+        proc = self.run_state(extra_env={"CLAUDE_CODE_SESSION_ID": SID})
+        out = proc.stdout.splitlines()
+        i = next(n for n, ln in enumerate(out) if ln.startswith("session id:"))
+        self.assertEqual([ln.split(":")[0] for ln in out[i:i + 4]],
+                         ["session id", "transcript", "lean-mode", "context-budget"], proc.stdout)
+
+    def test_project_is_never_printed_or_recorded(self):
+        self.on(project=self.SECRET)
+        for args in ((), ("--resume",)):
+            proc = self.run_state(*args)
+            self.assertEqual(self.lean_lines(proc), ["lean-mode: off (set for another project)"], proc.stdout)
+            self.assertNotIn(self.SECRET, self.combined(proc))
+        self.assertNotIn(self.SECRET, self.log.read_text(encoding="utf-8"))
+
+    def test_missing_file_prints_nothing_and_changes_nothing(self):
+        plain = self.run_state()
+        self.assertEqual(plain.returncode, 0, self.combined(plain))
+        self.assertEqual(self.lean_lines(plain), [])
+        self.state_dir.mkdir(parents=True)  # the directory alone changes nothing
+        self.assertEqual(self.run_state().stdout, plain.stdout)
+        self.on()
+        with_line = self.run_state()
+        rest = [ln for ln in with_line.stdout.splitlines(keepends=True) if not ln.startswith(self.PREFIX)]
+        self.assertEqual("".join(rest), plain.stdout, "the lean line is the only difference")
+
+    def test_malformed_file_prints_unknown_and_keeps_exit(self):
+        cases = {
+            "not json": "{nope",
+            "empty": "",
+            "list": "[true]",
+            "string": '"on"',
+            "on missing": '{"since": "%s"}' % self.SINCE,
+            "on not bool": '{"on": "yes", "since": "%s"}' % self.SINCE,
+            "on is 1": '{"on": 1}',
+            "on null": '{"on": null}',
+            "not utf-8": b"\xff\xfe{\x00",
+            "too deep": "[" * 200000,
+        }
+        for name, data in cases.items():
+            with self.subTest(case=name):
+                self.put(data)
+                proc = self.run_state()
+                self.assertEqual(proc.returncode, 0, self.combined(proc))
+                self.assertEqual(self.lean_lines(proc), ["lean-mode: unknown"], proc.stdout)
+                self.assertNotIn("Traceback", proc.stderr)
+
+    def test_unreadable_file_prints_unknown(self):
+        self.lean.mkdir(parents=True)  # a directory where the file should be
+        proc = self.run_state()
+        self.assertEqual(proc.returncode, 0, self.combined(proc))
+        self.assertEqual(self.lean_lines(proc), ["lean-mode: unknown"], proc.stdout)
+
+    def test_bad_since_prints_on_without_it(self):
+        bad = ["", "yesterday", "2026-11-10 01:02:03", "2026-11-10T01:02:03", "2026-11-10T01:02:03+09:00",
+               "2026-11-10T01:02:03Z\nlean-mode: off", self.SINCE + "\n", "/etc/passwd", "x" * 500,
+               " " + self.SINCE, "2026-13-10T01:02:03Z", 20261110, None, ["a"]]
+        for value in bad:
+            with self.subTest(since=value):
+                self.put({"on": True, "since": value, "project": self.repo.as_posix()})
+                proc = self.run_state()
+                self.assertEqual(proc.returncode, 0, self.combined(proc))
+                self.assertEqual(proc.stdout.splitlines().count("lean-mode: on"), 1, proc.stdout)
+                self.assertEqual(self.lean_lines(proc), ["lean-mode: on"], proc.stdout)
+        self.put({"on": True, "project": self.repo.as_posix()})
+        self.assertEqual(self.lean_lines(self.run_state()), ["lean-mode: on"], "no since key")
+        for good in ("2026-11-10T01:02:03Z", "2026-11-10T01:02:03.456Z", "2026-11-10T01:02:03+00:00"):
+            with self.subTest(since=good):
+                self.put({"on": True, "since": good, "project": self.repo.as_posix()})
+                self.assertEqual(self.lean_lines(self.run_state()), [f"lean-mode: on (since {good})"])
+
+    def test_matching_project_is_on_in_both_modes(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        self.on(project=self.repo.as_posix() + "/")  # a trailing slash is the same project
+        for args in ((), ("--resume",)):
+            proc = self.run_state(*args)
+            self.assertEqual(self.lean_lines(proc), [f"lean-mode: on (since {self.SINCE})"], proc.stdout)
+
+    def test_project_with_tilde_matches_after_expanduser(self):
+        work = self.home / "work"
+        work.mkdir()
+        self.git("init", "-q", "-b", "main", repo=work)
+        self.put({"on": True, "since": self.SINCE, "project": "~/work"})
+        self.assertEqual(self.lean_lines(self.run_state(cwd=work)), [f"lean-mode: on (since {self.SINCE})"])
+        self.assertEqual(self.lean_lines(self.run_state()), ["lean-mode: off (set for another project)"])
+
+    def test_linked_worktree_uses_the_main_tree_as_project(self):
+        tree = self.tmp / "linked"
+        self.git("worktree", "add", "-q", "-b", "side", str(tree))
+        self.on()  # the main tree
+        self.assertEqual(self.lean_lines(self.run_state(cwd=tree)), [f"lean-mode: on (since {self.SINCE})"])
+        self.on(project=tree.as_posix())  # the lean skill writes its cwd: the linked tree it was turned on in
+        self.assertEqual(self.lean_lines(self.run_state(cwd=tree)), [f"lean-mode: on (since {self.SINCE})"])
+        self.on(project=(tree / "sub").as_posix())
+        self.assertEqual(self.lean_lines(self.run_state(cwd=tree)), [f"lean-mode: on (since {self.SINCE})"])
+        # known limit (spec 21.9): another linked tree of the same repository is not recognised
+        other = self.tmp / "linked-other"
+        self.git("worktree", "add", "-q", "-b", "side2", str(other))
+        self.assertEqual(self.lean_lines(self.run_state(cwd=other)), ["lean-mode: off (set for another project)"])
+        self.on(project=str(self.tmp / "linked-x"))
+        self.assertEqual(self.lean_lines(self.run_state(cwd=tree)), ["lean-mode: off (set for another project)"])
+
+    def test_project_inside_the_project_key_matches(self):
+        for sub in ("sub", "a/b/c", "sub/"):
+            with self.subTest(sub=sub):
+                self.on(project=f"{self.repo.as_posix()}/{sub}")  # the cwd the lean skill ran in
+                for args in ((), ("--resume",)):
+                    proc = self.run_state(*args)
+                    self.assertEqual(self.lean_lines(proc), [f"lean-mode: on (since {self.SINCE})"], proc.stdout)
+        subdir = self.repo / "sub"
+        subdir.mkdir()
+        self.assertEqual(self.lean_lines(self.run_state(cwd=subdir)), [f"lean-mode: on (since {self.SINCE})"])
+
+    def test_project_prefix_lookalikes_and_dotdot_do_not_match(self):
+        repo = self.repo.as_posix()
+        for value in (repo + "-other/sub", repo + "x", repo + "//..", repo + "/../elsewhere", repo + "/sub/../../x"):
+            with self.subTest(project=value):
+                self.on(project=value)
+                self.assertEqual(self.lean_lines(self.run_state()), ["lean-mode: off (set for another project)"])
+
+    def test_non_git_cwd_subfolder_matches(self):
+        plain = self.tmp / "plain"
+        (plain / "deep").mkdir(parents=True)
+        self.put({"on": True, "since": self.SINCE, "project": (plain / "deep").as_posix()})
+        self.assertEqual(self.lean_lines(self.run_state(cwd=plain)), [f"lean-mode: on (since {self.SINCE})"])
+
+    def test_other_project_is_off_for_another_project(self):
+        repo = self.repo.as_posix()
+        others = [self.SECRET, repo + "-other", str(self.repo.parent), "", "  ", 7, None, ["x"], {"a": 1}]
+        for value in others:
+            with self.subTest(project=value):
+                self.on(project=value)
+                proc = self.run_state()
+                self.assertEqual(proc.returncode, 0, self.combined(proc))
+                self.assertEqual(self.lean_lines(proc), ["lean-mode: off (set for another project)"], proc.stdout)
+        self.put({"on": True, "since": self.SINCE})
+        self.assertEqual(self.lean_lines(self.run_state()), ["lean-mode: off (set for another project)"],
+                         "no project key")
+        self.put({"on": False, "since": self.SINCE, "project": self.SECRET})
+        self.assertEqual(self.lean_lines(self.run_state()), ["lean-mode: off"], "off stays plain off")
+
+    def test_resume_mode_prints_the_line_too(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        self.on()
+        proc = self.run_state("--resume", "--c")
+        self.assertEqual(proc.returncode, 0, self.combined(proc))
+        self.assertEqual(self.lean_lines(proc), [f"lean-mode: on (since {self.SINCE})"], proc.stdout)
+        out = proc.stdout.splitlines()
+        self.assertLess(out.index(f"lean-mode: on (since {self.SINCE})"), next(
+            n for n, ln in enumerate(out) if ln.startswith("continue:")))
+        self.on(project=self.SECRET)
+        self.assertEqual(self.lean_lines(self.run_state("--resume")), ["lean-mode: off (set for another project)"])
+        self.put({"on": False})
+        self.assertEqual(self.lean_lines(self.run_state("--resume")), ["lean-mode: off"])
+        self.put("{nope")
+        self.assertEqual(self.lean_lines(self.run_state("--resume")), ["lean-mode: unknown"])
+
+    def test_resume_without_handoff_still_prints_it_and_keeps_exit(self):
+        self.on()
+        proc = self.run_state("--resume")
+        self.assertEqual(proc.returncode, 1, self.combined(proc))
+        self.assertEqual(self.lean_lines(proc), [f"lean-mode: on (since {self.SINCE})"], proc.stdout)
+
+    def test_resume_without_file_is_unchanged(self):
+        self.write_handoff("2026-11-01-work-session.tmp", self.valid_handoff_text())
+        plain = self.run_state("--resume")
+        self.on()
+        with_line = self.run_state("--resume")
+        rest = [ln for ln in with_line.stdout.splitlines(keepends=True) if not ln.startswith(self.PREFIX)]
+        self.assertEqual("".join(rest), plain.stdout)
+        self.assertEqual(with_line.returncode, plain.returncode)
+
+    def test_run_log_gains_no_key(self):
+        self.run_state()
+        self.on()
+        self.run_state()
+        plain, with_line = [json.loads(ln) for ln in self.log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(set(plain), set(with_line))
+        self.assertEqual(len(plain), 26, sorted(plain))
+        self.assertIn(f"lean-mode: on (since {self.SINCE})", with_line["stdout"])
+        self.assertNotIn("lean-mode: on (since", "".join(plain["stdout"]))
+
+    def test_state_file_is_never_written(self):
+        self.on()
+        before = (self.lean.read_bytes(), self.lean.stat().st_mtime_ns)
+        self.run_state()
+        self.run_state("--resume")
+        self.assertEqual((self.lean.read_bytes(), self.lean.stat().st_mtime_ns), before)
+        self.assertEqual(sorted(p.name for p in self.state_dir.iterdir()), ["lean-mode.json"])
 
 
 if __name__ == "__main__":

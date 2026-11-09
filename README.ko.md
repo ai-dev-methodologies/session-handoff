@@ -136,7 +136,9 @@ flowchart TD
 | `## Goal (carried)` | `Origin` · `Goal` · `Done-when` · `Constraints` · `Changes` | 그대로 복사한다. 사용자가 바꾸라고 했을 때만 고친다. `Constraints`는 새 항목을 `; `로 이어 붙이는 것만 자유다. 기존 항목은 그대로 둔다. `none`은 항목 0개다 |
 | 작업 기록 절 | 무엇을 만드는지 · 된 것 · 안 된 것 · 버린 가설 · 아직 안 해 본 것 · 파일 상태 · 결정(`What`·`Why`·`How` 표) · 막힌 것 | 끝났고 이후 단계가 쓰지 않는 것은 이력 파일로 옮긴다. 안 된 것과 버린 가설은 남긴다 |
 | `## Closed (pointers)` | 이력 파일 경로와 닫은 항목 키 | 닫은 항목이 있을 때만 |
+| `## Reviews` | 세션의 검수 실행마다 1행(선택, 결정 바로 뒤) | 옮기지 않는다. 결론은 결정에 남긴다 |
 | `## Exact Next Step` | 다음 세션이 처음 할 일 | 매번 새로 쓴다 |
+| `## Before Handoff` | `/handoff` 직전 사용자 메시지와 그 인자마다 1줄(선택, `## After Handoff` 바로 앞) | 브리핑에서 읽는다. 본문에 다시 쓰지 않는다 |
 | `## After Handoff` | `/handoff`가 시작된 뒤 사용자 메시지마다 1줄(선택, 항상 맨 끝) | 브리핑에서 먼저 읽는다. 본문에 다시 쓰지 않는다 |
 
 ## 역할
@@ -210,12 +212,23 @@ flowchart TD
 `/handoff`가 시작된 뒤 사용자가 준 결정은 핸드오프 본문에 없다. 게이트 두 개가 이를 잃지 않게 한다.
 
 - 핸드오프 파일에는 머리 줄 `**Session:** <id>`(`/handoff` Step 0에서 `handoff_state.py`가 출력하는 `session id:` 줄 값, 없으면 `none`)와 맨 끝 선택 절 `## After Handoff`가 있다. `/handoff`가 시작된 뒤 사용자 메시지는 입력했든 대기열에 있었든 질문 창 답이든 모두 이 절에 1줄씩 적는다: `- 「<사용자 원문>」 → 결정: <무엇을 어떻게 바꿨나>`. `→ 결정: 변경 없음`도 1줄이다. 본문은 다시 쓰지 않으며, 본문과 어긋나면 이 절이 우선한다.
-- 쓰는 쪽 게이트: `CLAUDE_CODE_SESSION_ID`가 UUID이면 `check_handoff.py`가 이 세션의 전사를 읽는다. 마지막 `/handoff` 뒤 사용자 메시지가 절에 실려 있지 않으면(줄마다 `- 「`로 시작하고, 다른 줄 안에 든 인용은 세지 않는다) `after-handoff`로 exit 1이고 빠진 메시지를 원문 그대로 최대 5줄 출력한다. `**Session:**`이 없거나 이 세션의 id가 아니면 `contract-session`으로 exit 1이다. 다른 세션에서 옛 파일을 손으로 검사할 때는 `env -u CLAUDE_CODE_SESSION_ID python3 ~/.claude/scripts/check_handoff.py <파일> --git yes|no`로 실행한다.
+- 쓰는 쪽 게이트: `CLAUDE_CODE_SESSION_ID`가 UUID이면 `check_handoff.py`가 이 세션의 전사를 읽는다. 마지막 `/handoff` 뒤 사용자 메시지가 절에 실려 있지 않으면(40자 미만 메시지는 자기 줄이 `- 「`로 시작해야 하고, 그보다 긴 메시지는 전체 인용이 한 줄 안에 있으면 센다. 300자를 넘는 메시지는 앞 259자와 끝 40자가 한 줄 안에 있으면 센다) `after-handoff`로 exit 1이고 빠진 메시지를 원문 그대로 최대 5줄 출력한다. `**Session:**`이 없거나 이 세션의 id가 아니면 `contract-session`으로 exit 1이다. 다른 세션에서 옛 파일을 손으로 검사할 때는 `env -u CLAUDE_CODE_SESSION_ID python3 ~/.claude/scripts/check_handoff.py <파일> --git yes|no`로 실행한다.
 - 재개 게이트: 파일의 `**Session:**`이 UUID이면 `handoff_state.py --resume`이 그 전사를 다시 읽는다. 절에 실리지 않은 메시지가 있으면 `--c`여도 `continue: no (unrecorded messages after handoff)`가 되고, `WARNING: N user message(s) after the last /handoff are not in the handoff file`와 메시지마다 들여쓴 1줄을 출력한다. `project mismatch`와 `newer handoff skipped`가 이 이유보다 먼저이지만 WARNING은 어느 쪽이든 나온다. 브리핑은 `AFTER HANDOFF:` 블록으로 시작한다. 진행하려면 사용자는 옛 세션으로 돌아가(`claude --resume <**Session:** id>`) 빠진 줄을 `## After Handoff`에 덧붙이고 검사기를 다시 실행하거나, 새 세션에서 `계속`이라고 말한다. `계속`이면 빠진 메시지를 최신 결정으로 보고 먼저 반영한다.
 - 판독 실패 때: 전사가 없거나 읽을 수 없거나 너무 크거나 형식을 모르거나 `/handoff` 입력이 없으면 두 게이트 모두 `WARNING: after-handoff messages not checked: <이유>`를 출력한다. 종료 코드와 `continue:`는 바뀌지 않는다. `**Session:**`이 없거나 `none`인 파일은 재개 때 검사하지 않는다.
 - 출력 계약: 세션 변수가 UUID이면 `handoff_state.py` 기본 모드가 `session id: <uuid>`와 `transcript: <경로 | none (not found)>` 2줄을 더 출력하므로 기본 출력은 25줄 대신 최대 27줄이다. 변수가 없으면 출력은 그대로다.
 - `run_report.py`는 새 경고 종류 2개 `after-handoff messages not checked`와 `user messages after the last /handoff not in the handoff file`를 센다. 새 실패 코드 2개는 `fail_codes`에서 센다.
 - 받아들인 한계: 게이트는 사용자 메시지만 비교한다. 입력되지 않은 결정이나 `/handoff` 실행 전에 세션이 파일에서 빠뜨린 결정은 잡지 못한다.
+
+### Before Handoff와 Reviews
+선택 절 2개가 `/handoff` 직전에 세션이 알던 것을 남긴다.
+
+- `## Before Handoff`(`## After Handoff` 바로 앞): 마지막 `/handoff` 입력 직전 사용자 메시지(마지막 5개)와 그 입력의 인자마다 1줄이다. 줄은 `- 「<사용자 본인 문장>」 → 반영: <절 제목>` 또는 `- 「…」 → 무관`이다. `반영:` 뒤에는 파일의 `## ` 절 제목을 정확히 적는다. 어시스턴트 출력의 긴 인용으로 시작하는 메시지는 본인 문장이 40자 이상이면 그 문장부터 적는다. 줄은 메시지 전체를 인용한다. 300자를 넘으면 앞 259자, `…`, 끝 40자다. 옮길 줄은 검사기가 보여 준다.
+- `## Reviews`(`## Decisions Made` 바로 뒤): 세션의 검수 실행마다 1행이다: `- <에이전트 id | runId> · <타입> · <최종 판정 | running> · <채택 또는 기각, 1줄>`. 검수 실행은 `subagent_type`의 마지막 `:` 뒤가 `review`·`critic`·`judge`를 담거나 `architect`·`verifier`와 같은 Agent, 그리고 모든 Workflow 실행이다. 다른 타입의 에이전트가 한 검수는 세지 않는다.
+- 쓰는 쪽 게이트: `CLAUDE_CODE_SESSION_ID`가 UUID이면 `check_handoff.py`가 빠진 줄이나 행마다 `before-handoff` 또는 `reviews`로 exit 1이다. 보인 행을 그대로 옮기면 판정과 마지막 칸을 채울 때까지 계속 실패한다. `Exact Next Step`의 번호 단계 중 🔴 사용자 단계 뒤에 `(독립)`이나 `(← n)`이 없는 단계가 있으면 `contract-next-step-deps`로 exit 1이다. 전사를 읽지 못하면 after-handoff WARNING 옆에 `WARNING: reviews not checked: <이유>`가 나오고 종료 코드는 바뀌지 않는다. 검수 실행 결과에 `agentId`(Workflow는 `runId`)가 없을 때도 같은 WARNING이 나오고, id가 있는 실행은 그대로 검사한다.
+- 재개: `handoff_state.py --resume`이 `before handoff: N user message(s)`와 메시지(최대 6개)를 출력한다. `## Before Handoff`에 없는 것이 있으면 WARNING도 낸다. 표시만 하므로 `continue:`는 바뀌지 않는다. 브리핑에는 `BEFORE HANDOFF:` 블록과 `REVIEWS:` 블록이 있다.
+- 크기: 검사기는 24 KiB를 넘으면 경고한다(`WARNING: handoff file is <N> KiB (over 24 KiB)`).
+- 출력 계약: 세션 변수가 없으면 출력은 2026.11.09-3과 바이트 단위로 같다. 예외는 usage 줄(`over 24 KiB`), 항목 실패 줄 끝의 ` (missing: …)`와 새 `contract-live-chain` 문구, 24 KiB 크기 경고다. 전체 목록은 `CHANGELOG.md`에 있다.
+- 받아들인 한계: `무관`은 막지 않는다. 브리핑이 원문을 보여 주므로 잘못 판정한 줄을 알아볼 수 있다.
 
 ## 실행 기록
 - 두 스크립트는 실행마다 JSON 1줄을 `~/.claude/handoffs/.state/runs.jsonl`에 덧붙인다. 핸드오프 파일의 본문은 기록하지 않고 경로만 기록한다.
@@ -225,7 +238,7 @@ flowchart TD
 ### 실행 기록 보고
 `run_report.py`는 실행 기록(`runs.jsonl.1`이 있으면 함께)을 읽어 무슨 일이 있었고 무엇을 고칠지 보여 준다. 기록에는 쓰지 않는다. 기록의 `stdout`과 `args` 원문은 출력하지 않는다. 보고 출력에는 로컬 경로와 세션 id가 들어 있으므로 공개 저장소에 보고 출력을 붙여 넣지 않는다.
 
-기록 한 줄은 키 19개를 가진다. 아래 5개가 가장 새 키다. 값이 없는 키는 `null`이다. 옛 버전이 쓴 줄에는 이 키가 없고, 보고는 그런 줄을 Coverage에서 센다.
+기록 한 줄은 키 26개를 가진다. 아래 12개가 가장 새 키다. 값이 없는 키는 `null`이다. 옛 버전이 쓴 줄에는 이 키가 없고, 보고는 그런 줄을 Coverage에서 센다.
 
 | 키 | 내용 |
 |---|---|
@@ -234,6 +247,13 @@ flowchart TD
 | `project` | 프로젝트 키. 검사 실행은 검사한 파일의 `**Toplevel:**`이 존재하는 절대 경로 폴더일 때 그 값 |
 | `fail_codes` | `check_handoff.py`만 쓴다. 고정된 실패 코드와 개수의 객체이고 통과하면 `{}`다. `handoff_state.py` 기록은 `null` |
 | `handoff_bytes` | `check_handoff.py`만 쓴다. 줄바꿈을 LF로 맞춘 뒤 검사한 본문의 UTF-8 바이트 수(검사기의 `WARNING: handoff file is <N> KiB` 줄과 같은 기준) |
+| `after_handoff_lines` | 쓰는 쪽 `check_handoff.py`만 쓴다. 마지막 `/handoff` 뒤 사용자 메시지 수다. 게이트가 돌지 않았거나 전사를 판독하지 못하면 `null`이다 |
+| `before_handoff_lines` | 같은 쪽이다. Before Handoff 대상 메시지 수(`/handoff` 인자 포함, 0~6)다 |
+| `before_unrelated` | 같은 쪽이다. 맞춰진 Before Handoff 줄 중 `무관`으로 끝나는 수다 |
+| `attempt_n` | 같은 쪽이다. 이 세션이 이 핸드오프 파일을 검사한 시도 번호다. 앞선 직접 검사 수에 1을 더한다(로그 파일이 아직 없으면 1). 경로는 `expanduser` 뒤 절대 경로로 비교한다 |
+| `elapsed_ms` | 같은 쪽이다. 마지막 `/handoff` 입력부터 이 검사까지 밀리초다 |
+| `reviews_found` | 같은 쪽이다. 전사에서 찾은 검수 실행 수다. 판독하지 못하면 `null`이다 |
+| `reviews_recorded` | 같은 쪽이다. 그중 `## Reviews`에 유효한 행이 있는 수다 |
 
 ```
 python3 ~/.claude/scripts/run_report.py [--log PATH] [--since DATE] [--project PATH] [--version V] [--json]
@@ -247,6 +267,9 @@ python3 ~/.claude/scripts/run_report.py [--log PATH] [--since DATE] [--project P
 | `--version V` | 그 버전의 기록만. `V`는 `V-<n>`과 `V.<n>`도 포함한다 |
 | `--json` | 같은 내용을 고정 키 JSON으로 낸다 |
 
+- 사용법만 출력한 실행은 Runs에서 `handoff_state.py/usage` 또는 `check_handoff.py/usage`로 센다. 검사기 usage 실행은 코드 `usage`로도 센다.
+- Check failures는 버전별 통과까지 시도 수(`attempts_by_version`)를 버전마다 1줄로 보인다.
+- Handoff size는 `~/.claude/handoffs/` 바로 아래 파일의 마지막 직접 검사만 센다. 재개 때 검사기 실행과 fixture, 임시 경로는 뺀다. 기준은 24 KiB(`over_24_kib`)다.
 - 종료 코드 0: 보고를 출력했다. 기록 파일이 없거나 비어 있을 때도 같다.
 - 종료 코드 2: 사용법 오류(예: 잘못된 `--since` 값, `--log` 없이 `HANDOFF_LOG=off`), 읽을 수 없는 기록 경로, 또는 내부 오류(stderr 1줄, traceback 없음).
 
@@ -278,6 +301,8 @@ python3 ~/.claude/scripts/run_report.py [--log PATH] [--since DATE] [--project P
 | `HANDOFF_CALLER` | `handoff_state.py`가 자신이 실행하는 검사기에 정한다. 값이 `handoff_state.py`일 때만 실행 기록에 `caller`로 남긴다 |
 
 `~/.claude/scripts/context_budget.py`가 있으면 `handoff_state.py`가 그 파일을 불러 `context-budget:` 줄을 낸다. 없으면 줄을 내지 않는다. 이 파일은 이 저장소에 없고 `install.py`도 건드리지 않는다.
+
+`~/.claude/state/lean-mode.json`(lean 스킬이 쓴다)이 있으면 `handoff_state.py`가 `lean-mode:` 줄(`on (since <UTC 시각>)`·`off`·`off (set for another project)`·`unknown`) 하나를 내어 재개한 세션이 절약 모드가 이어짐을 알게 한다. 절약 모드는 프로젝트 단위다. 파일의 `project`가 현재 프로젝트일 때만 `on`이고, 경로는 내지 않는다. 파일이 없으면 줄을 내지 않는다.
 
 ## 규칙 파일
 핵심 규칙은 모든 사용자에게 같다. 사용자와 프로젝트가 다르게 하고 싶은 것은 규칙 파일 2개에 적는다. 층은 아래 순서로 적용한다.

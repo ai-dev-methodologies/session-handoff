@@ -18,6 +18,12 @@ Text output has a run report line, a filters line, then 9 `## ` sections in fixe
 without data prints `(none)`. Paths under the home folder print as `~/...`. A record's raw `stdout`
 and `args` are never printed. Do not paste a report into a public repository.
 
+A run that only printed the usage (handoff_state.py with no argument or `-h`/`--help`, check_handoff.py with
+`-h`/`--help`) is counted as `<script>/usage` in Runs, and a check usage run as the code `usage`. Check failures
+also gives the attempts to pass per version (`attempts_by_version`, a line per version, at most 10). Handoff size
+counts the last direct check of each file directly under ~/.claude/handoffs/ (a resume's own check, a fixture or
+scratch path stays out); its limit is 24 KiB (`over_24_kib`).
+
 Exit codes: 0 ok (no records or no log file included) · 2 usage error, unreadable log, or an internal
 error (one stderr line, never a traceback).
 """
@@ -36,11 +42,12 @@ TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 SESSION_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")  # = run_log.SESSION_ID
 AGE_RE = re.compile(r"handoff age: (\d+(?:\.\d+)?) days")
 SKIP_RE = re.compile(r"newer handoff skipped \(([^)]*)\)")
+HELP_ARGS = ("-h", "--help")
 SKIP_REASONS = ("empty file", "project unknown", "not valid UTF-8", "no usable Exact Next Step")
 CHECK_SCRIPT = "check_handoff.py"
 STATE_SCRIPT = "handoff_state.py"
 TOP = 10
-KIB_LIMIT = 16 * 1024
+KIB_LIMIT = 24 * 1024
 SECTIONS = ("Runs", "Versions", "Warnings", "Check failures", "Resume", "Handoff size", "Projects",
             "Sessions", "Coverage")
 NEW_KEYS = ("session_id", "project", "fail_codes", "caller")
@@ -72,6 +79,9 @@ WARNING_KINDS = (
     (re.compile(r"WARNING: after-handoff messages not checked: "), "after-handoff messages not checked"),
     (re.compile(r"WARNING: N user message\(s\) after the last /handoff are not in the handoff file$"),
      "user messages after the last /handoff not in the handoff file"),
+    (re.compile(r"WARNING: N user message\(s\) before the last /handoff are not in the handoff file$"),
+     "user messages before the last /handoff not in the handoff file"),
+    (re.compile(r"WARNING: reviews not checked: "), "reviews not checked"),
 )
 
 
@@ -206,6 +216,17 @@ def is_resume(rec) -> "bool":
     return rec.get("script") == STATE_SCRIPT and rec.get("mode") == "resume"
 
 
+def is_usage(rec) -> "bool":
+    """A run that only printed the usage: handoff_state.py with no argument or `-h`/`--help` first (never a
+    resume, whose args start with the cwd), or check_handoff.py with exactly `-h` or `--help`."""
+    args = rec.get("args")
+    if not isinstance(args, list):
+        return False
+    if rec.get("script") == STATE_SCRIPT:
+        return rec.get("mode") != "resume" and (not args or args[0] in HELP_ARGS)
+    return is_check(rec) and len(args) == 1 and args[0] in HELP_ARGS
+
+
 def caller_kind(rec) -> "str":
     if "caller" not in rec:
         return "unknown"
@@ -296,7 +317,7 @@ def skip_reasons(line: "str"):
 def runs_section(rows):
     table = {}
     for row in rows:
-        key = f"{clean(row.rec.get('script'))}/{clean(row.rec.get('mode'))}"
+        key = f"{clean(row.rec.get('script'))}/{'usage' if is_usage(row.rec) else clean(row.rec.get('mode'))}"
         entry = table.setdefault(key, {"records": 0, "exit": {}})
         entry["records"] += 1
         code = int_of(row.rec, "exit")
@@ -314,7 +335,7 @@ def versions_section(rows):
     table = {}
     for row in rows:
         rec = row.rec
-        name = clean(rec.get("version")) if isinstance(rec.get("version"), str) and rec["version"].strip() else "(none)"
+        name = version_name(rec)
         entry = table.setdefault(name, {"version": name, "records": 0, "check_runs": 0, "check_failed": 0,
                                         "resume_runs": 0, "resume_continue_yes": 0})
         entry["records"] += 1
@@ -349,48 +370,60 @@ def code_of(raw, vocabulary) -> "str":
     return raw if isinstance(raw, str) and raw in vocabulary else "other"
 
 
+def version_name(rec) -> "str":
+    return clean(rec.get("version")) if isinstance(rec.get("version"), str) and rec["version"].strip() else "(none)"
+
+
+def attempt_stats(groups) -> "dict":
+    """groups: per handoff file, the exit codes of its direct checks, oldest first."""
+    groups = list(groups)
+    passed = [exits.index(0) + 1 for exits in groups if 0 in exits]
+    return {
+        "groups": len(groups),
+        "first_try_pass_rate": rate(sum(1 for n in passed if n == 1), len(groups)),
+        "median": tidy(median(passed)) if passed else None,
+        "max": max(passed) if passed else None,
+        "never_passed": len(groups) - len(passed),
+    }
+
+
 def check_failures_section(rows, norm, vocabulary):
     checks = [r for r in rows if is_check(r.rec)]
     codes = {}
     for row in checks:
         fail_codes = row.rec.get("fail_codes")
-        if not isinstance(fail_codes, dict):
-            continue
         seen = {}
-        for raw, number in fail_codes.items():
+        for raw, number in (fail_codes.items() if isinstance(fail_codes, dict) else ()):
             if isinstance(number, int) and not isinstance(number, bool) and number > 0:
                 code = code_of(raw, vocabulary)
                 seen[code] = seen.get(code, 0) + number
+        if is_usage(row.rec):
+            seen = {"usage": 1}  # the checker records --help as {"unreadable": 1}: one run, counted once
         for code, number in seen.items():
             entry = codes.setdefault(code, {"runs": 0, "messages": 0})
             entry["runs"] += 1
             entry["messages"] += number
-    groups, unattributed = {}, 0
+    groups, by_version, unattributed = {}, {}, 0
     for row in checks:
         if not is_direct_check(row.rec):
             continue
         sid, handoff = session_of(row.rec), norm(row.rec.get("handoff"))
         if sid and handoff:
             groups.setdefault((sid, handoff), []).append(int_of(row.rec, "exit"))
+            by_version.setdefault((version_name(row.rec), sid, handoff), []).append(int_of(row.rec, "exit"))
         else:
             unattributed += 1
-    passed = []
-    for exits in groups.values():
-        if 0 in exits:
-            passed.append(exits.index(0) + 1)
-    attempts = {
-        "groups": len(groups),
-        "first_try_pass_rate": rate(sum(1 for n in passed if n == 1), len(groups)),
-        "median": tidy(median(passed)) if passed else None,
-        "max": max(passed) if passed else None,
-        "never_passed": len(groups) - len(passed),
-        "unattributed": unattributed,
-    }
+    attempts = {**attempt_stats(groups.values()), "unattributed": unattributed}
+    versions = {}
+    for (version, _, _), exits in by_version.items():
+        versions.setdefault(version, []).append(exits)
+    attempts_by_version = [{"version": v, **attempt_stats(versions[v])} for v in sorted(versions)]
     return {
         "check_runs": len(checks),
         "failed_runs": sum(1 for r in checks if int_of(r.rec, "exit") != 0),
         "codes": {k: codes[k] for k, _ in sorted(codes.items(), key=lambda kv: (-kv[1]["runs"], kv[0]))},
         "attempts": attempts,
+        "attempts_by_version": attempts_by_version,
     }
 
 
@@ -437,14 +470,24 @@ def resume_section(rows, all_rows, norm):
     }
 
 
-def size_section(rows):
-    sizes = sorted(n for r in rows if is_check(r.rec) for n in [int_of(r.rec, "handoff_bytes")]
-                   if n is not None and n >= 0)
+def size_section(rows, norm):
+    """Sizes of the handoff files a person wrote: direct checks (no resume's own, no old record) of a file
+    directly under <home>/.claude/handoffs/, the last record of each file. Fixtures and scratch paths stay out."""
+    try:
+        folder = norm(str(Path.home() / ".claude" / "handoffs"))
+    except RuntimeError:  # no home folder: no handoff file can be told from a fixture
+        folder = None
+    last = {}
+    for row in rows:
+        n, key = int_of(row.rec, "handoff_bytes"), norm(row.rec.get("handoff"))
+        if folder and key and n is not None and n >= 0 and is_direct_check(row.rec) and key.rsplit("/", 1)[0] == folder:
+            last[key] = n
+    sizes = sorted(last.values())
     if not sizes:
-        return {"n": 0, "min": None, "median": None, "p90": None, "max": None, "over_16_kib": 0}
+        return {"n": 0, "min": None, "median": None, "p90": None, "max": None, "over_24_kib": 0}
     p90 = sizes[-(-9 * len(sizes) // 10) - 1]  # nearest rank
     return {"n": len(sizes), "min": sizes[0], "median": tidy(median(sizes)), "p90": p90, "max": sizes[-1],
-            "over_16_kib": sum(1 for n in sizes if n > KIB_LIMIT)}
+            "over_24_kib": sum(1 for n in sizes if n > KIB_LIMIT)}
 
 
 def projects_section(rows):
@@ -495,7 +538,7 @@ def build(log, used_rotated, rows, all_rows, skipped, filters, norm, vocabulary,
         "warnings": warnings_section(rows),
         "check_failures": check_failures_section(rows, norm, vocabulary),
         "resume": resume_section(rows, all_rows, norm),
-        "handoff_size": size_section(rows),
+        "handoff_size": size_section(rows, norm),
         "projects": projects_section(rows),
         "sessions": sessions_section(rows, find),
         "coverage": coverage_section(rows),
@@ -554,6 +597,10 @@ def check_lines(failures):
                  f"{percent(attempts['first_try_pass_rate'])} · median {attempts['median'] if attempts['median'] is not None else '-'}"
                  f" · max {attempts['max'] if attempts['max'] is not None else '-'}"
                  f" · never passed {attempts['never_passed']} · unattributed {attempts['unattributed']}")
+    for entry in failures["attempts_by_version"][:TOP]:
+        lines.append(f"attempts {entry['version']}: groups {entry['groups']} · first-try pass "
+                     f"{percent(entry['first_try_pass_rate'])} · median {entry['median'] if entry['median'] is not None else '-'}"
+                     f" · max {entry['max'] if entry['max'] is not None else '-'} · never passed {entry['never_passed']}")
     return lines
 
 
@@ -576,7 +623,7 @@ def size_lines(size):
     if not size["n"]:
         return []
     return [f"n {size['n']} · min {size['min']} · median {size['median']} · p90 {size['p90']} · "
-            f"max {size['max']} · over 16 KiB {size['over_16_kib']}"]
+            f"max {size['max']} · over 24 KiB {size['over_24_kib']}"]
 
 
 def coverage_lines(cov):

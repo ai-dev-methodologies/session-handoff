@@ -57,6 +57,10 @@ value goes into the `**Session:**` header (Step 5). The `transcript:` path is th
 transcript file; Step 2 derives the subagent result paths from it. Without the variable neither line
 is printed, and the header reads `**Session:** none`.
 
+When the lean skill's state file `~/.claude/state/lean-mode.json` exists, the script also prints one
+`lean-mode:` line (`on (since <UTC time>)`, `on` (when `since` is not a strict UTC time), `off`, `off (set for another project)`, or `unknown`) before the `context-budget:` line; the
+resumed session reads the same file again, so the file does not record it.
+
 Read the rules files it names, in this order, with the `Read` tool before anything else:
 
 1. `user rules file: <path|none>`: `~/.claude/handoff-rules.local.md`, the user's own operating
@@ -232,7 +236,7 @@ Write `## Goal (carried)` before `## What We Are Building`, with its five keys:
 When the previous file has no `Goal (carried)` (it was written in an older format), build the
 section from its `What We Are Building` and the user's own words, and set `Origin` to that file.
 
-**Size cap.** The cap is the project `values` size cap, or 16 KiB when `values` sets none. When the
+**Size cap.** The cap is the project `values` size cap, or 24 KiB when `values` sets none. When the
 file would exceed it, shorten in this order and stop as soon as it fits:
 
 1. Closed items that can move to the history file.
@@ -273,11 +277,10 @@ several questions joined by ` / `, several choices for one question by `, `), ap
 - 「<user message verbatim>」 → 결정: <what changed and how>
 ```
 
-Write the line even when nothing changed: `→ 결정: 변경 없음`. Copy the message as typed; cut one
-over 300 characters to its first 300 plus `…`. Write `REDACTED` only where the checker's printed line
+Write the line even when nothing changed: `→ 결정: 변경 없음`. Copy the message as typed, whole; cut one
+over 300 characters to its first 259 characters, `…`, and its last 40. Write `REDACTED` only where the checker's printed line
 shows `REDACTED`. If a message holds a secret the checker does not mask, never write the value:
-report `not ready — unmaskable secret in a message` and tell the user. If the secret sits after the
-first 40 characters, quote up to it and end with `…` instead. Otherwise this is the only exception
+report `not ready — unmaskable secret in a message` and tell the user. This is the only exception
 to the "exits 0" rule; never run `/handoff` again to clear it (the baseline would move past that
 message). Never rewrite
 the body to absorb the decision: when a decision contradicts the body, this section is later and wins.
@@ -285,6 +288,48 @@ Append only; do not touch existing lines. When `/handoff` runs again (typed by t
 through the Skill tool), first add a line for every user message since the previous run that has
 none, and carry every existing line over (as is, or folded into the body with its quote); the
 baseline then moves.
+
+**Before Handoff.** When `CLAUDE_CODE_SESSION_ID` is a UUID, the checker lists the user messages that
+came right before the last `/handoff` input (the last 5, counted past earlier `/handoff` inputs) and
+that input's arguments, at most 6. Add one line for each to `## Before Handoff`, right before
+`## After Handoff` (last in the file when there is no such section):
+
+```
+- 「<the user's own sentence>」 → 반영: <section title>
+- 「<the user's own sentence>」 → 무관
+```
+
+Copy the lines the checker shows. A message that opens with a quote of the assistant's output (a
+`'…'` span, a `「…」` span, or lines opening with `>`) is written from the user's own sentence on
+when that sentence is 40 characters or more (a shorter one keeps the quote); copying the quote along
+on one line also passes. A message of several lines goes on one line. A line quotes the message
+whole; one over 300 characters is its first 259 characters, `…`, and its last 40. Everything after the last
+`→ ` is the disposition. `반영: <section title>` names a `## ` section of this file exactly as it is
+titled (not Before Handoff or After Handoff). `무관` means the message changed nothing in this file;
+a few words may follow it. A message that gave an instruction or a decision is never `무관`: record
+it in Decisions Made, Goal (carried), or Exact Next Step, and name that section. When `/handoff`
+runs again, write the section again from the checker's lines for the new `/handoff` input.
+
+**Reviews.** When the checker finds review runs in this session's transcript, `## Reviews` (right
+after `## Decisions Made`) holds one row per run, in launch order:
+
+```
+- <agent id | runId> · <type> · <final verdict | running> · <adopted or rejected, one line>
+```
+
+A review run is an Agent whose `subagent_type`, after its last `:`, contains `review`, `critic`, or
+`judge` or equals `architect` or `verifier`, and every Workflow run. The id is the `agentId` or
+`runId` of the run's result. The checker shows each missing row as
+`- <id> · <type> · <verdict> · <채택/기각>`: replace the last two cells. The verdict is the run's
+last return, and `running` when it has not returned by the time `/handoff` runs. Never write a
+transcript path in a row. An agent's transcript is `subagents/agent-<id>.jsonl` and a Workflow's is
+`subagents/workflows/<runId>/`, both under the folder of the `transcript:` path without `.jsonl`.
+Rows of earlier sessions are not carried over: keep their conclusions in Decisions Made or
+Discarded Hypotheses.
+
+**Next-step order.** When a numbered step of `## Exact Next Step` is a 🔴 user step (the user acts
+first), end every later numbered step with `(독립)` (or `(independent)`) when it can start now, or
+with `(← n)` (or `(<- n)`) naming the earlier step n it waits for.
 
 ### Step 6: Check, report and continue
 
@@ -301,7 +346,11 @@ file without a matching `Changes` entry, a `Constraints` whose items do not star
 (new items are added at the end, separated by `; `) and has no `Changes` entry that contains `Constraints:`, a `**Continues:**` that is
 neither `none` nor an existing absolute path, a `Closed (pointers)` path that does not exist or
 lacks a listed key, and a Live item of the previous handoff that is neither carried nor closed
-(`Live item <name> from the previous handoff is missing`). It also fails on a secret value in a
+(`Live item <name> from the previous handoff is missing`). An open item that fails ends with
+`(missing: what, why, how)`, naming the lines it lacks: write it as
+`- … — what: … · why: "…" · how: …` (or give a design-file path). A missing Live item is fixed by
+keeping an item with that id in a Live field, or by closing it with one `Closed (pointers)` line such as
+`- 1 items closed → <history file> (keys: <id>)`. It also fails on a secret value in a
 provider-specific format: a token, or a private key block (from the `BEGIN … PRIVATE KEY` line to
 its `END` line, or a run of three or more long base64 lines). It prints the kind and the line or
 lines and never prints the value. The fix is to replace the token, or the whole key block, with
@@ -310,23 +359,31 @@ before every other failure. The
 `Goal (carried)` comparison does not count that `REDACTED` replacement as a change. Fix those
 items and run it again; do not report until it exits 0 (the one exception: an unmaskable secret in
 a user message, Step 5). The checker also prints
-`WARNING: handoff file is <N> KiB (over 16 KiB)` for a large file, after the result block
+`WARNING: handoff file is <N> KiB (over 24 KiB)` for a large file, after the result block
 (`[PASS]` or `[FAIL]` and its list); the exit code does not change. Shorten the file as Step 5
 describes. Keep the never-trim list; a file that still exceeds the cap after that is left as it
-is. The checker's limit is fixed at 16 KiB. The project `values` size cap is used only for the
+is. The checker's limit is fixed at 24 KiB. The project `values` size cap is used only for the
 Step 5 shortening order, and the checker never reads it.
 `/resume-handoff` runs the same checker on load, so a file that passes here is a file the next
 session can resume with one command.
 
-When `CLAUDE_CODE_SESSION_ID` is a UUID, the checker also reads this session's transcript, and two
-more failures can appear. `contract-session` fires when the `**Session:**` line is missing or is not
+When `CLAUDE_CODE_SESSION_ID` is a UUID, the checker also reads this session's transcript, and these
+failures can appear. `contract-session` fires when the `**Session:**` line is missing or is not
 this session's id (message `**Session:** must be this session's id <id>`). `after-handoff` fires
-when a user message after the last `/handoff` is not quoted in `## After Handoff` (each line opens
-with `- 「`; a quote nested inside another line does not count): it exits 1 and
+when a user message after the last `/handoff` is not quoted in `## After Handoff` (a message under 40
+characters must open its own `- 「` line; a longer one counts when its whole quote, or for one over 300
+characters its first 259 characters and its last 40, appears inside one line): it exits 1 and
 prints each missing message verbatim, at most 5 lines. Fix it by appending the missing lines to
-`## After Handoff` (`→ 결정:` as in Step 5); do not rewrite the body. When the transcript cannot be
-read, it prints `WARNING: after-handoff messages not checked: <reason>` after the result block and
-the exit code does not change. To run the checker by hand from another session on an older file, drop
+`## After Handoff` (`→ 결정:` as in Step 5); do not rewrite the body.
+`before-handoff` fires when a message before the last `/handoff`, or an argument of it, is not in
+`## Before Handoff` with a valid disposition (Step 5). `reviews` fires when a review run of this
+session has no valid row in `## Reviews`: a row copied as the checker shows it still fails until the
+verdict and the last cell are filled. `contract-next-step-deps` fires when a numbered step after the
+first 🔴 step of `## Exact Next Step` lacks `(독립)` or `(← n)`. When the transcript cannot be
+read, it prints `WARNING: after-handoff messages not checked: <reason>` and
+`WARNING: reviews not checked: <reason>` after the result block and the exit code does not change.
+A review launch whose result carries no `agentId` (`runId` for a Workflow) prints the same reviews
+WARNING; the runs that carry one are still checked. To run the checker by hand from another session on an older file, drop
 the session variable so the writing-side checks are skipped:
 `env -u CLAUDE_CODE_SESSION_ID python3 ~/.claude/scripts/check_handoff.py <file> --git yes|no`
 (on Windows, clear the variable first with `set CLAUDE_CODE_SESSION_ID=`).
@@ -357,6 +414,9 @@ clear an after-handoff failure: append the lines instead):
   file the handoff points at.
 - Every user message after the last `/handoff` is quoted in `## After Handoff` (the checker tests
   this).
+- Every message and argument the checker lists for `## Before Handoff` is there with its
+  disposition (the checker tests this).
+- Every review run of this session has a row in `## Reviews` (the checker tests this).
 - No write to the handoff file is still pending (a lane whose result you are about to fold in
   within the next minute: fold it in first, then report).
 
@@ -523,6 +583,15 @@ If none: "No major decisions made this session."
 
 ---
 
+## Reviews
+
+[Optional. Omit when the checker found no review run in this session. One row per review run, in
+launch order; the verdict is the run's last return, `running` while it has not returned.]
+
+- [agent id | runId] · [type] · [final verdict | running] · [adopted or rejected, one line]
+
+---
+
 ## User Assumptions
 
 [Omit when empty. Statements the user made about the system that are not verifiable in the code.
@@ -566,7 +635,11 @@ If none: "No active blockers."
 [The single most important thing to do on resuming, precise enough that no thinking is needed
 to start. If any live item exists, step 1 is to judge it as `/resume-handoff` Step 3 describes
 (returned, running, or lost) before the rest. If genuinely unknown, say so and point at the sections that
-decide the direction.]
+decide the direction. When a numbered step is a 🔴 user step, every later numbered step ends with
+`(독립)` or `(← n)`, as in:
+1. 🔴 [what the user must do]
+2. [a step that waits for step 1] (← 1)
+3. [a step that does not wait] (독립)]
 
 ---
 
@@ -574,6 +647,17 @@ decide the direction.]
 
 [Omit unless the project needs something non-obvious: commands to run it, services that must be
 up, environment variable names that must be set. Names only, never values.]
+
+---
+
+## Before Handoff
+
+[Optional. Omit when the checker lists no message. Right before `## After Handoff`, or last when that
+section is absent. One line per message the user gave right before `/handoff` and per argument of
+`/handoff`, as the checker shows it:]
+
+- 「[the user's own sentence]」 → 반영: [the title of a `## ` section of this file]
+- 「[the user's own sentence]」 → 무관
 
 ---
 

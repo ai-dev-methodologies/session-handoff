@@ -4,6 +4,84 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions are dates (`YYYY.MM.DD-N`), the
 same value that every run writes to the run log as `version`.
 
+## [2026.11.10-1] - 2026-11-10
+
+### Added
+- Before Handoff gate. The user messages right before the last `/handoff` input (the last 5, counted
+  past earlier `/handoff` inputs) and that input's arguments are recorded in a new optional section
+  `## Before Handoff`, right before `## After Handoff` (last in the file when there is none). One line
+  per message: `- 「<the user's own sentence>」 → 반영: <section title>` or `- 「…」 → 무관`. `반영:` must
+  name a `## ` section of the file exactly (not Before Handoff or After Handoff). A message that opens
+  with a quote of the assistant's output (`'…'`, `「…」`, or `>` lines of 40 characters or more, with 40
+  characters or more of text after it) is recorded from the user's own sentence on; copying the quote
+  along on one line also passes.
+  `check_handoff.py` exits 1 with the new failure code `before-handoff` (one per missing message) and
+  prints the lines to copy, only when `CLAUDE_CODE_SESSION_ID` is a UUID.
+- Reviews gate. Every review run of the session (an Agent whose `subagent_type`, after its last `:`,
+  contains `review`, `critic`, or `judge` or equals `architect` or `verifier`, and every Workflow run)
+  needs a row in a new optional section `## Reviews`, right after `## Decisions Made`:
+  `- <agent id | runId> · <type> · <final verdict | running> · <adopted or rejected, one line>`.
+  A missing row, or a row whose verdict or last cell is empty or a placeholder, fails with the new
+  failure code `reviews`; the printed row is not enough as it stands, so it fails until both cells are
+  filled. When the transcript cannot be read, `WARNING: reviews not checked: <reason>` follows the
+  result block and the exit code does not change. A review launch whose result carries no `agentId`
+  (`runId` for a Workflow) prints the same WARNING; the runs that carry one are still checked. Accepted limit: a review done by an agent whose type
+  matches none of these words is not counted.
+- Resume briefing. `handoff_state.py --resume` prints `before handoff: N user message(s)` with the
+  messages (at most 6) after the after-handoff lines and before `handoff age:`, and
+  `WARNING: N user message(s) before the last /handoff are not in the handoff file` when
+  `## Before Handoff` does not record them all. It is display only: `continue:` does not change. The
+  briefing of `/resume-handoff` gets a `BEFORE HANDOFF:` block (after `AFTER HANDOFF:`) and a `REVIEWS:`
+  block (after `DECIDED`). The Steps 0-3 call list is unchanged.
+- Next-step order. When a numbered step of `## Exact Next Step` is a 🔴 user step, every later numbered
+  step ends with `(독립)`, `(independent)`, `(← n)`, or `(<- n)`; otherwise the new failure code
+  `contract-next-step-deps` fires. It is checked on the writing side only, so older files still resume.
+- Run log: 7 new integer keys, always present (`null` when there is no value), so a line has 26 keys:
+  `after_handoff_lines`, `before_handoff_lines`, `before_unrelated`, `attempt_n` (the try number at one
+  handoff file in one session; 1 when the log file does not exist yet), `elapsed_ms` (since the last `/handoff` input), `reviews_found`,
+  `reviews_recorded`. In its default mode `handoff_state.py` records the `previous handoff:` path in
+  the `handoff` field. A check record's `handoff` is now the absolute path after `expanduser`; a `~user`
+  that does not resolve is kept unexpanded instead of dropping the record.
+- `run_report.py`: a run that only printed the usage is counted as `handoff_state.py/usage` or
+  `check_handoff.py/usage` (and the failure code `usage`); `attempts_by_version` in Check failures gives
+  the attempts to pass per version; two new warning kinds, `user messages before the last /handoff not in
+  the handoff file` and `reviews not checked`.
+- Lean mode line. When `~/.claude/state/lean-mode.json` (the lean skill's state file) exists,
+  `handoff_state.py` prints one `lean-mode:` line in both modes: `on (since <UTC time>)`, `off`,
+  `off (set for another project)`, or `unknown` (unreadable or malformed; the exit code does not
+  change). The mode is project-scoped: `on` counts only when the file's `project` is the current
+  project key, `since` is printed only when it is a strict UTC timestamp, and the path is never
+  printed. Without the file the stdout is unchanged. The run log gets no new key (26).
+
+### Changed
+- Stdout contract exceptions. Without `CLAUDE_CODE_SESSION_ID`, or for a file without `**Session:**`,
+  every output is byte-identical to 2026.11.09-3 except these:
+  - The module docstring of `check_handoff.py` changes in one place, `(over 16 KiB)` to
+    `(over 24 KiB)`, so the usage output differs by exactly one line. It is the only exception to the
+    rule that the docstring stays as it is.
+  - A failing open item ends with ` (missing: what, why, how)`, naming the lines it lacks, and the
+    `contract-live-chain` line reads `Live item <name> from the previous handoff is missing: keep an item
+    with id <key> in a Live field, or list <key> in a Closed (pointers) keys list`. Both apply with or
+    without the session variable.
+  - The size limit is 24 KiB: a file between 16 and 24 KiB no longer prints
+    `WARNING: handoff file is <N> KiB`, and a larger one prints `(over 24 KiB)`. The Step 5 size cap
+    default is 24 KiB too.
+  - The 🔴 check of `contract-next-step-deps` runs on the writing side only.
+- After Handoff matching is stricter and shared with Before Handoff. A message that opens with a quote of
+  the assistant's output is matched by its own sentence when 40 characters or more of it follow the
+  quote, a message of 300 characters or less must be quoted whole, and a longer one is shown and
+  matched as its first 259 characters, `…`, and its last 40 (it was the first 300 and `…`). A file written
+  with the old matching may need `계속` on resume.
+- `run_report.py`: the size statistics count the last direct check of each file directly under
+  `~/.claude/handoffs/` (a resume's own check, a fixture, and a scratch path are left out); the limit is
+  24 KiB, so the JSON key `over_16_kib` is now `over_24_kib` and the text reads `over 24 KiB`.
+- Run log version is `2026.11.10-1`.
+
+### Known limits
+- A `무관` line is not gated; the briefing shows the original message so a misjudged one can be seen.
+- Reviews of earlier sessions are not carried into `## Reviews`; their conclusions belong in
+  `Decisions Made` or `Discarded Hypotheses`.
+
 ## [2026.11.09-3] - 2026-11-09
 
 ### Added
